@@ -26,7 +26,41 @@ typedef struct {
     int sock;
 } RegisterData;
 
+typedef struct {
+    GtkLabel *label;
+    int minutes;
+    int seconds;
+} TimerData;
+
+typedef struct {
+    int question_id;
+    int selected_choice;
+} Answer;
+
+typedef struct {
+    GtkWidget *dialog;
+    int room_id;
+    Answer *answers;
+    int answer_count;
+    int sock;
+} ExamData;
+
 static void logout(GtkWidget *button, AppData *data) {
+    // Gửi thông báo logout đến server
+    send(data->sock, "LOGOUT", 6, 0);
+    
+    // Đóng socket hiện tại
+    close(data->sock);
+    
+    // Tạo socket mới
+    data->sock = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in serv_addr;
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(PORT);
+    inet_pton(AF_INET, "127.0.0.1", &serv_addr.sin_addr);
+    connect(data->sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr));
+    
+    // Đóng cửa sổ chính và hiển thị cửa sổ đăng nhập
     gtk_window_destroy(GTK_WINDOW(data->main_window));
     gtk_widget_show(data->window);
 }
@@ -35,21 +69,299 @@ static void dialog_response(GtkDialog *dialog, gint response_id, gpointer user_d
     gtk_window_destroy(GTK_WINDOW(dialog));
 }
 
+static gboolean show_error_dialog(const char *message, AppData *data) {
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Lỗi",
+                                                   GTK_WINDOW(data->main_window),
+                                                   GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+                                                   "_OK",
+                                                   GTK_RESPONSE_ACCEPT,
+                                                   NULL);
+    
+    GtkWidget *content_area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *label = gtk_label_new(message + 6); 
+    gtk_box_append(GTK_BOX(content_area), label);
+    
+    g_signal_connect(dialog, "response", G_CALLBACK(gtk_window_destroy), NULL);
+    gtk_window_present(GTK_WINDOW(dialog));
+    
+    return TRUE; // Trả về TRUE để dừng các callback tiếp theo
+}
+
+static gboolean update_timer(gpointer user_data) {
+    TimerData *data = (TimerData *)user_data;
+    
+    // Kiểm tra con trỏ
+    if (!data || !data->label) {
+        return G_SOURCE_REMOVE;
+    }
+
+    // Kiểm tra widget có còn tồn tại và visible
+    if (!GTK_IS_WIDGET(data->label) || !gtk_widget_get_visible(GTK_WIDGET(data->label))) {
+        g_free(data);
+        return G_SOURCE_REMOVE;
+    }
+    
+    // Giảm thời gian
+    if (data->seconds > 0) {
+        data->seconds--;
+    } else if (data->minutes > 0) {
+        data->minutes--;
+        data->seconds = 59;
+    } else {
+        // Hết giờ
+        gtk_label_set_text(data->label, "Hết giờ!");
+        g_free(data);  // Giải phóng bộ nhớ
+        return G_SOURCE_REMOVE;
+    }
+
+    // Cập nhật label
+    char new_text[50];
+    snprintf(new_text, sizeof(new_text), "Thời gian còn lại: %02d:%02d", 
+             data->minutes, data->seconds);
+    gtk_label_set_text(data->label, new_text);
+
+    return G_SOURCE_CONTINUE;
+}
+
+static void on_answer_selected(GtkCheckButton *button, gpointer user_data) {
+    if (gtk_check_button_get_active(button)) {
+        Answer *answer = (Answer *)user_data;
+        answer->selected_choice = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "choice_id"));
+    }
+}
+
+static void handle_exam_response(GtkDialog *dialog, gint response_id, gpointer user_data) {
+    ExamData *exam_data = (ExamData *)user_data;
+    
+    if (response_id == GTK_RESPONSE_ACCEPT) {
+        // Tạo chuỗi chứa kết quả
+        char request[MAX_BUFFER] = "SUBMIT_EXAM|";
+        char temp[32];
+        snprintf(temp, sizeof(temp), "%d", exam_data->room_id);
+        strcat(request, temp);
+        
+        for (int i = 0; i < exam_data->answer_count; i++) {
+            snprintf(temp, sizeof(temp), "|%d,%d", 
+                    exam_data->answers[i].question_id,
+                    exam_data->answers[i].selected_choice);
+            strcat(request, temp);
+        }
+        
+        // Gửi lên server
+        send(exam_data->sock, request, strlen(request), 0);
+        
+        // Nhận response
+        char response[MAX_BUFFER] = {0};  // Khởi tạo buffer với 0
+        ssize_t received = recv(exam_data->sock, response, MAX_BUFFER, 0);        
+        if (received < 0) {
+            perror("Error receiving response");
+            return;
+        }
+        
+        if (strncmp(response, "ERROR:", 6) == 0) {
+            AppData temp_data = {
+                .main_window = GTK_WIDGET(dialog)
+            };
+            show_error_dialog(response, &temp_data);
+        } else if (strncmp(response, "RESULT:", 7) == 0) {
+            // Lấy kết quả từ phản hồi
+            GtkWidget *result_dialog = gtk_dialog_new_with_buttons(
+                "Kết quả bài thi",
+                GTK_WINDOW(dialog),
+                GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+                "_OK",
+                GTK_RESPONSE_ACCEPT,
+                NULL
+            );
+            
+            GtkWidget *content_area = gtk_dialog_get_content_area(GTK_DIALOG(result_dialog));
+            gtk_widget_set_margin_start(content_area, 20);
+            gtk_widget_set_margin_end(content_area, 20);
+            gtk_widget_set_margin_top(content_area, 20);
+            gtk_widget_set_margin_bottom(content_area, 20);
+
+            // Tạo label mới cho kết quả
+            GtkWidget *result_label = gtk_label_new(NULL);
+            gtk_label_set_text(GTK_LABEL(result_label), response + 7);
+            gtk_box_append(GTK_BOX(content_area), result_label);
+            
+            // Kết nối tín hiệu để đóng cả hai dialog
+            g_signal_connect_swapped(result_dialog, "response", 
+                                     G_CALLBACK(gtk_window_destroy), dialog);
+            g_signal_connect(result_dialog, "response", 
+                             G_CALLBACK(gtk_window_destroy), result_dialog);
+
+            // Hiển thị dialog kết quả
+            gtk_window_present(GTK_WINDOW(result_dialog));
+        }
+    }
+    
+    // Giải phóng bộ nhớ và đóng dialog thi
+    g_free(exam_data->answers);
+    g_free(exam_data);
+}
+
+static void show_exam_interface(AppData *data, const char *exam_data, int room_id, int time_limit) {
+    // Tạo dialog thay vì window
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Làm bài thi",
+                                                   GTK_WINDOW(data->main_window),
+                                                   GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+                                                   "_Nộp bài",
+                                                   GTK_RESPONSE_ACCEPT,
+                                                   "_Hủy",
+                                                   GTK_RESPONSE_CANCEL,
+                                                   NULL);
+    gtk_window_set_default_size(GTK_WINDOW(dialog), 1000, 800);
+
+    GtkWidget *content_area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    gtk_widget_set_margin_start(content_area, 20);
+    gtk_widget_set_margin_end(content_area, 20);
+    gtk_widget_set_margin_top(content_area, 20);
+    gtk_widget_set_margin_bottom(content_area, 20);
+
+    // Header hiển thị thời gian
+    GtkWidget *header_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    char initial_time[50];
+    snprintf(initial_time, sizeof(initial_time), "Thời gian còn lại: %02d:00", time_limit);
+    GtkWidget *time_label = gtk_label_new(initial_time);
+    gtk_box_append(GTK_BOX(header_box), time_label);
+    
+    // Cấp phát động cho timer data
+    TimerData *timer_data = g_new(TimerData, 1);
+    timer_data->label = GTK_LABEL(time_label);
+    timer_data->minutes = time_limit;
+    timer_data->seconds = 0;
+    
+    // Thiết lập timer
+    guint timer_id = g_timeout_add_seconds(1, update_timer, timer_data);
+
+    // Scrolled window cho danh sách câu hỏi
+    GtkWidget *scrolled = gtk_scrolled_window_new();
+    gtk_scrolled_window_set_min_content_height(GTK_SCROLLED_WINDOW(scrolled), 600);
+    gtk_widget_set_vexpand(scrolled, TRUE);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolled),
+                                 GTK_POLICY_NEVER,
+                                 GTK_POLICY_AUTOMATIC);
+
+    // Box chứa các câu hỏi
+    GtkWidget *questions_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 20);
+
+    // Phân tích dữ liệu câu hỏi
+    char *question = strtok((char *)exam_data, "|");
+    int q_num = 1;
+    
+    // Khởi tạo ExamData
+    ExamData *exam_send_data = g_new(ExamData, 1);
+    exam_send_data->room_id = room_id;
+    exam_send_data->answers = g_new(Answer, 20);
+    exam_send_data->answer_count = 0;
+    exam_send_data->sock = data->sock;
+
+    while (question != NULL) {
+        // Frame cho mỗi câu hỏi
+        GtkWidget *q_frame = gtk_frame_new(NULL);
+        GtkWidget *q_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+        gtk_widget_set_margin_start(q_box, 10);
+        gtk_widget_set_margin_end(q_box, 10);
+        gtk_widget_set_margin_top(q_box, 10);
+        gtk_widget_set_margin_bottom(q_box, 10);
+
+        // Phân tích thông tin câu hỏi
+        char q_text[256], a1[100], a2[100], a3[100], a4[100];
+        int q_id, a1_id, a2_id, a3_id, a4_id;
+        sscanf(question, "%d;%[^;];%d;%[^;];%d;%[^;];%d;%[^;];%d;%[^;]", 
+               &q_id, q_text, &a1_id, a1, &a2_id, a2, &a3_id, a3, &a4_id, a4);
+
+        // Text câu hỏi
+        char q_label_text[300];
+        snprintf(q_label_text, sizeof(q_label_text), "Câu %d: %s", q_num, q_text);
+        GtkWidget *q_label = gtk_label_new(q_label_text);
+        gtk_label_set_wrap(GTK_LABEL(q_label), TRUE);
+        gtk_label_set_xalign(GTK_LABEL(q_label), 0);
+        gtk_box_append(GTK_BOX(q_box), q_label);
+
+        // Radio buttons cho các đáp án (sử dụng check button với group)
+        GtkWidget *group = gtk_check_button_new_with_label(a1);
+        gtk_check_button_set_group(GTK_CHECK_BUTTON(group), NULL);
+        
+        GtkWidget *radio2 = gtk_check_button_new_with_label(a2);
+        gtk_check_button_set_group(GTK_CHECK_BUTTON(radio2), GTK_CHECK_BUTTON(group));
+        
+        GtkWidget *radio3 = gtk_check_button_new_with_label(a3);
+        gtk_check_button_set_group(GTK_CHECK_BUTTON(radio3), GTK_CHECK_BUTTON(group));
+        
+        GtkWidget *radio4 = gtk_check_button_new_with_label(a4);
+        gtk_check_button_set_group(GTK_CHECK_BUTTON(radio4), GTK_CHECK_BUTTON(group));
+
+        // Lưu ID đáp án vào button
+        g_object_set_data(G_OBJECT(group), "choice_id", GINT_TO_POINTER(a1_id));
+        g_object_set_data(G_OBJECT(radio2), "choice_id", GINT_TO_POINTER(a2_id));
+        g_object_set_data(G_OBJECT(radio3), "choice_id", GINT_TO_POINTER(a3_id));
+        g_object_set_data(G_OBJECT(radio4), "choice_id", GINT_TO_POINTER(a4_id));
+
+        // Thêm các đáp án vào box
+        gtk_box_append(GTK_BOX(q_box), group);
+        gtk_box_append(GTK_BOX(q_box), radio2);
+        gtk_box_append(GTK_BOX(q_box), radio3);
+        gtk_box_append(GTK_BOX(q_box), radio4);
+
+        gtk_frame_set_child(GTK_FRAME(q_frame), q_box);
+        gtk_box_append(GTK_BOX(questions_box), q_frame);
+
+        // Lưu question_id vào answers array
+        exam_send_data->answers[exam_send_data->answer_count].question_id = q_id;
+        exam_send_data->answers[exam_send_data->answer_count].selected_choice = -1;
+        exam_send_data->answer_count++;
+
+        // Kết nối signal cho radio buttons
+        g_signal_connect(group, "toggled", G_CALLBACK(on_answer_selected), &exam_send_data->answers[exam_send_data->answer_count-1]);
+        g_signal_connect(radio2, "toggled", G_CALLBACK(on_answer_selected), &exam_send_data->answers[exam_send_data->answer_count-1]);
+        g_signal_connect(radio3, "toggled", G_CALLBACK(on_answer_selected), &exam_send_data->answers[exam_send_data->answer_count-1]);
+        g_signal_connect(radio4, "toggled", G_CALLBACK(on_answer_selected), &exam_send_data->answers[exam_send_data->answer_count-1]);
+
+        question = strtok(NULL, "|");
+        q_num++;
+    }
+
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scrolled), questions_box);
+
+    // Thêm vào content area
+    gtk_box_append(GTK_BOX(content_area), header_box);
+    gtk_box_append(GTK_BOX(content_area), scrolled);
+
+    exam_send_data->dialog = dialog;
+    g_signal_connect(dialog, "response", G_CALLBACK(handle_exam_response), exam_send_data);
+    
+    gtk_window_present(GTK_WINDOW(dialog));
+}
 
 static void join_exam_room(GtkButton *button, AppData *data) {
-    // int room_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "room_id"));
+    int room_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "room_id"));
+    int time_limit = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "time_limit"));
     
-    // // Gửi yêu cầu tham gia phòng thi
-    // char request[MAX_BUFFER];
-    // snprintf(request, sizeof(request), "JOIN_EXAM|%d", room_id);
-    // send(data->sock, request, strlen(request), 0);
+    // Gửi yêu cầu tham gia phòng thi
+    char request[MAX_BUFFER];
+    snprintf(request, sizeof(request), "JOIN_EXAM|%d", room_id);
+    send(data->sock, request, strlen(request), 0);
     
-    // // Nhận danh sách câu hỏi
-    // char response[MAX_BUFFER];
-    // recv(data->sock, response, MAX_BUFFER, 0);
+    // Nhận danh sách câu hỏi
+    char response[MAX_BUFFER];
+    recv(data->sock, response, MAX_BUFFER, 0);
     
-    // // Hiển thị giao diện làm bài thi
-    // show_exam_interface(data, response, room_id);
+    // Kiểm tra nếu có lỗi
+    if (strncmp(response, "ERROR:", 6) == 0) {
+        show_error_dialog(response, data);
+        return;
+    }
+    
+    // Kiểm tra và bỏ prefix QUESTIONS:
+    char *exam_data = response;
+    if (strncmp(response, "QUESTIONS:", 10) == 0) {
+        exam_data = response + 10;
+    }
+    
+    // Hiển thị giao diện làm bài thi với time_limit
+    show_exam_interface(data, exam_data, room_id, time_limit);
 }
 
 static void show_exam_list(GtkButton *button, gpointer user_data) {
@@ -141,6 +453,7 @@ static void show_exam_list(GtkButton *button, gpointer user_data) {
         
         // Lưu room_id vào button để sử dụng khi click
         g_object_set_data(G_OBJECT(join_button), "room_id", GINT_TO_POINTER(room_id));
+        g_object_set_data(G_OBJECT(join_button), "time_limit", GINT_TO_POINTER(time_limit));
         g_signal_connect(join_button, "clicked", G_CALLBACK(join_exam_room), data);
         
         gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(row), box);
@@ -155,125 +468,357 @@ static void show_exam_list(GtkButton *button, gpointer user_data) {
     gtk_window_present(GTK_WINDOW(dialog));
 }
 
-// static void show_exam_interface(AppData *data, const char *exam_data, int room_id) {
-//     // Tạo cửa sổ mới cho bài thi
-//     GtkWidget *exam_window = gtk_window_new();
-//     gtk_window_set_title(GTK_WINDOW(exam_window), "Làm bài thi");
-//     gtk_window_set_default_size(GTK_WINDOW(exam_window), 1000, 800);
-
-//     // Container chính
-//     GtkWidget *main_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
-//     gtk_widget_set_margin_start(main_box, 20);
-//     gtk_widget_set_margin_end(main_box, 20);
-//     gtk_widget_set_margin_top(main_box, 20);
-//     gtk_widget_set_margin_bottom(main_box, 20);
-
-//     // Header hiển thị thời gian
-//     GtkWidget *header_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
-//     GtkWidget *time_label = gtk_label_new("Thời gian còn lại: 45:00");
-//     GtkWidget *submit_button = gtk_button_new_with_label("Nộp bài");
-//     gtk_box_append(GTK_BOX(header_box), time_label);
-//     gtk_box_append(GTK_BOX(header_box), submit_button);
-
-//     // Scrolled window cho danh sách câu hỏi
-//     GtkWidget *scrolled = gtk_scrolled_window_new();
-//     gtk_scrolled_window_set_min_content_height(GTK_SCROLLED_WINDOW(scrolled), 600);
-    
-//     // Box chứa các câu hỏi
-//     GtkWidget *questions_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 20);
-
-//     // Phân tích dữ liệu câu hỏi từ exam_data
-//     char *question = strtok((char *)exam_data, "|");
-//     int q_num = 1;
-    
-//     while (question != NULL) {
-//         // Tạo frame cho mỗi câu hỏi
-//         GtkWidget *q_frame = gtk_frame_new(NULL);
-//         GtkWidget *q_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
-//         gtk_widget_set_margin_start(q_box, 10);
-//         gtk_widget_set_margin_end(q_box, 10);
-//         gtk_widget_set_margin_top(q_box, 10);
-//         gtk_widget_set_margin_bottom(q_box, 10);
-
-//         // Phân tích thông tin câu hỏi
-//         char q_text[256], a1[100], a2[100], a3[100], a4[100];
-//         sscanf(question, "%[^;];%[^;];%[^;];%[^;];%[^;]", 
-//                q_text, a1, a2, a3, a4);
-
-//         // Thêm text câu hỏi
-//         char q_label_text[300];
-//         snprintf(q_label_text, sizeof(q_label_text), "Câu %d: %s", q_num, q_text);
-//         GtkWidget *q_label = gtk_label_new(q_label_text);
-//         gtk_label_set_wrap(GTK_LABEL(q_label), TRUE);
-//         gtk_label_set_xalign(GTK_LABEL(q_label), 0);
-//         gtk_box_append(GTK_BOX(q_box), q_label);
-
-//         // Tạo radio buttons cho các đáp án
-//         GtkWidget *radio1 = gtk_check_button_new_with_label(a1);
-//         GtkWidget *radio2 = gtk_check_button_new_with_label(a2);
-//         GtkWidget *radio3 = gtk_check_button_new_with_label(a3);
-//         GtkWidget *radio4 = gtk_check_button_new_with_label(a4);
-
-//         // Nhóm các radio buttons
-//         gtk_check_button_set_group(GTK_CHECK_BUTTON(radio2), GTK_CHECK_BUTTON(radio1));
-//         gtk_check_button_set_group(GTK_CHECK_BUTTON(radio3), GTK_CHECK_BUTTON(radio1));
-//         gtk_check_button_set_group(GTK_CHECK_BUTTON(radio4), GTK_CHECK_BUTTON(radio1));
-
-//         // Thêm các đáp án vào box
-//         gtk_box_append(GTK_BOX(q_box), radio1);
-//         gtk_box_append(GTK_BOX(q_box), radio2);
-//         gtk_box_append(GTK_BOX(q_box), radio3);
-//         gtk_box_append(GTK_BOX(q_box), radio4);
-
-//         // Thêm vào frame và box chính
-//         gtk_frame_set_child(GTK_FRAME(q_frame), q_box);
-//         gtk_box_append(GTK_BOX(questions_box), q_frame);
-
-//         question = strtok(NULL, "|");
-//         q_num++;
-//     }
-
-//     // Thiết lập scrolled window
-//     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scrolled), questions_box);
-
-//     // Thêm tất cả vào main box
-//     gtk_box_append(GTK_BOX(main_box), header_box);
-//     gtk_box_append(GTK_BOX(main_box), scrolled);
-
-//     // Thiết lập và hiển thị cửa sổ
-//     gtk_window_set_child(GTK_WINDOW(exam_window), main_box);
-//     gtk_window_present(GTK_WINDOW(exam_window));
-// }
-
 static void show_history(GtkButton *button, gpointer user_data) {
-    GtkWidget *dialog = gtk_dialog_new_with_buttons("Thông báo",
-                                                   GTK_WINDOW(user_data),
+    AppData *data = (AppData *)user_data;
+    
+    // Tạo dialog mới
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Lịch sử thi",
+                                                   GTK_WINDOW(data->main_window),
                                                    GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
-                                                   "_OK",
-                                                   GTK_RESPONSE_ACCEPT,
+                                                   "_Đóng",
+                                                   GTK_RESPONSE_CLOSE,
                                                    NULL);
+    gtk_window_set_default_size(GTK_WINDOW(dialog), 800, 400);
     
     GtkWidget *content_area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
-    GtkWidget *label = gtk_label_new("Thống kê lịch sử thi sẽ hiển thị ở đây");
-    gtk_box_append(GTK_BOX(content_area), label);
+    gtk_widget_set_margin_start(content_area, 20);
+    gtk_widget_set_margin_end(content_area, 20);
+    gtk_widget_set_margin_top(content_area, 20);
+    gtk_widget_set_margin_bottom(content_area, 20);
     
-    g_signal_connect(dialog, "response", G_CALLBACK(dialog_response), NULL);
+    // Tạo list box để hiển thị lịch sử
+    GtkListBox *list_box = GTK_LIST_BOX(gtk_list_box_new());
+    
+    // Gửi yêu cầu lấy lịch sử thi
+    send(data->sock, "GET_EXAM_HISTORY", 16, 0);
+    
+    char response[MAX_BUFFER];
+    recv(data->sock, response, MAX_BUFFER, 0);
+    
+    if (strncmp(response, "ERROR:", 6) == 0) {
+        GtkWidget *error_label = gtk_label_new(response + 6);
+        gtk_box_append(GTK_BOX(content_area), error_label);
+    } else if (strncmp(response, "EXAM_HISTORY:", 13) == 0) {
+        char *history = response + 13;
+        printf("history: %s\n", history);
+        char *record = strtok(history, "|");
+        
+        // Header row
+        GtkWidget *header_row = gtk_list_box_row_new();
+        GtkWidget *header_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 20);
+        gtk_widget_set_margin_start(header_box, 10);
+        gtk_widget_set_margin_end(header_box, 10);
+        gtk_widget_set_margin_top(header_box, 5);
+        gtk_widget_set_margin_bottom(header_box, 5);
+        
+        GtkWidget *room_header = gtk_label_new("Phòng thi");
+        GtkWidget *score_header = gtk_label_new("Điểm");
+        GtkWidget *start_header = gtk_label_new("Thời gian bắt đầu");
+        GtkWidget *end_header = gtk_label_new("Thời gian kết thúc");
+        
+        gtk_widget_set_size_request(room_header, 200, -1);
+        gtk_widget_set_size_request(score_header, 100, -1);
+        gtk_widget_set_size_request(start_header, 200, -1);
+        gtk_widget_set_size_request(end_header, 200, -1);
+        
+        gtk_box_append(GTK_BOX(header_box), room_header);
+        gtk_box_append(GTK_BOX(header_box), score_header);
+        gtk_box_append(GTK_BOX(header_box), start_header);
+        gtk_box_append(GTK_BOX(header_box), end_header);
+        
+        gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(header_row), header_box);
+        gtk_list_box_append(list_box, GTK_LIST_BOX_ROW(header_row));
+        
+        while (record != NULL) {
+            printf("record: %s\n", record);
+            char score_str[20], start_time[50], end_time[50], room_name[100];
+            memset(start_time, 0, sizeof(start_time));
+            memset(end_time, 0, sizeof(end_time));
+            memset(room_name, 0, sizeof(room_name));
+            sscanf(record, "%[^,],%[^,],%[^,],%[^\n]", score_str, start_time, end_time, room_name);
+            
+            GtkWidget *row = gtk_list_box_row_new();
+            GtkWidget *box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 20);
+            gtk_widget_set_margin_start(box, 10);
+            gtk_widget_set_margin_end(box, 10);
+            gtk_widget_set_margin_top(box, 5);
+            gtk_widget_set_margin_bottom(box, 5);
+
+            printf("room_name: %s, score: %s, start_time: %s, end_time: %s\n", room_name, score_str, start_time, end_time);
+            
+            GtkWidget *room_label = gtk_label_new(room_name);
+            GtkWidget *score_label = gtk_label_new(score_str);
+            GtkWidget *start_label = gtk_label_new(start_time);
+            GtkWidget *end_label = gtk_label_new(end_time);
+            
+            gtk_widget_set_size_request(room_label, 200, -1);
+            gtk_widget_set_size_request(score_label, 100, -1);
+            gtk_widget_set_size_request(start_label, 200, -1);
+            gtk_widget_set_size_request(end_label, 200, -1);
+            
+            gtk_box_append(GTK_BOX(box), room_label);
+            gtk_box_append(GTK_BOX(box), score_label);
+            gtk_box_append(GTK_BOX(box), start_label);
+            gtk_box_append(GTK_BOX(box), end_label);
+            
+            gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(row), box);
+            gtk_list_box_append(list_box, GTK_LIST_BOX_ROW(row));
+            
+            record = strtok(NULL, "|");
+        }
+    }
+    
+    gtk_box_append(GTK_BOX(content_area), GTK_WIDGET(list_box));
+    g_signal_connect(dialog, "response", G_CALLBACK(gtk_window_destroy), NULL);
     gtk_window_present(GTK_WINDOW(dialog));
 }
 
-static void show_practice(GtkButton *button, gpointer user_data) {
-    GtkWidget *dialog = gtk_dialog_new_with_buttons("Thông báo",
-                                                   GTK_WINDOW(user_data),
+static void handle_practice_response(GtkDialog *dialog, gint response_id, gpointer user_data) {
+    ExamData *practice_data = (ExamData *)user_data;
+    
+    if (response_id == GTK_RESPONSE_ACCEPT) {
+        // Tạo chuỗi chứa kết quả
+        char request[MAX_BUFFER] = "SUBMIT_PRACTICE|";
+        
+        for (int i = 0; i < practice_data->answer_count; i++) {
+            char temp[32];
+            snprintf(temp, sizeof(temp), "%d,%d|", 
+                    practice_data->answers[i].question_id,
+                    practice_data->answers[i].selected_choice);
+            strcat(request, temp);
+        }
+        
+        // Gửi lên server
+        send(practice_data->sock, request, strlen(request), 0);
+        
+        // Nhận response
+        char response[MAX_BUFFER];
+        recv(practice_data->sock, response, MAX_BUFFER, 0);
+        
+        if (strncmp(response, "ERROR:", 6) == 0) {
+            AppData temp_data = {
+                .main_window = GTK_WIDGET(dialog)
+            };
+            show_error_dialog(response, &temp_data);
+        } else if (strncmp(response, "RESULT:", 7) == 0) {
+            // Hiển thị kết quả
+            GtkWidget *result_dialog = gtk_dialog_new_with_buttons(
+                "Kết quả luyện tập",
+                GTK_WINDOW(dialog),
+                GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+                "_OK",
+                GTK_RESPONSE_ACCEPT,
+                NULL
+            );
+            
+            GtkWidget *content_area = gtk_dialog_get_content_area(GTK_DIALOG(result_dialog));
+            gtk_widget_set_margin_start(content_area, 20);
+            gtk_widget_set_margin_end(content_area, 20);
+            gtk_widget_set_margin_top(content_area, 20);
+            gtk_widget_set_margin_bottom(content_area, 20);
+
+            GtkWidget *result_label = gtk_label_new(NULL);
+            gtk_label_set_text(GTK_LABEL(result_label), response + 7);
+            gtk_box_append(GTK_BOX(content_area), result_label);
+            
+            g_signal_connect(result_dialog, "response", 
+                           G_CALLBACK(gtk_window_destroy), result_dialog);
+            g_signal_connect_swapped(result_dialog, "response", 
+                                   G_CALLBACK(gtk_window_destroy), dialog);
+
+            gtk_window_present(GTK_WINDOW(result_dialog));
+        }
+    }
+    
+    // Giải phóng bộ nhớ
+    g_free(practice_data->answers);
+    g_free(practice_data);
+}
+
+static void show_practice_interface(AppData *data, const char *practice_data) {
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Luyện tập",
+                                                   GTK_WINDOW(data->main_window),
                                                    GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
-                                                   "_OK",
+                                                   "_Nộp bài",
                                                    GTK_RESPONSE_ACCEPT,
+                                                   "_Hủy",
+                                                   GTK_RESPONSE_CANCEL,
                                                    NULL);
+    gtk_window_set_default_size(GTK_WINDOW(dialog), 1000, 800);
+
+    GtkWidget *content_area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    gtk_widget_set_margin_start(content_area, 20);
+    gtk_widget_set_margin_end(content_area, 20);
+    gtk_widget_set_margin_top(content_area, 20);
+    gtk_widget_set_margin_bottom(content_area, 20);
+
+    // Header hiển thị thời gian
+    GtkWidget *header_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    GtkWidget *time_label = gtk_label_new("Thời gian còn lại: 30:00");
+    gtk_box_append(GTK_BOX(header_box), time_label);
+    
+    // Timer data
+    TimerData *timer_data = g_new(TimerData, 1);
+    timer_data->label = GTK_LABEL(time_label);
+    timer_data->minutes = 30;
+    timer_data->seconds = 0;
+    
+    // Thiết lập timer
+    guint timer_id = g_timeout_add_seconds(1, update_timer, timer_data);
+
+    // Scrolled window cho danh sách câu hỏi
+    GtkWidget *scrolled = gtk_scrolled_window_new();
+    gtk_scrolled_window_set_min_content_height(GTK_SCROLLED_WINDOW(scrolled), 600);
+    gtk_widget_set_vexpand(scrolled, TRUE);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolled),
+                                 GTK_POLICY_NEVER,
+                                 GTK_POLICY_AUTOMATIC);
+
+    // Box chứa các câu hỏi
+    GtkWidget *questions_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 20);
+
+    // Phân tích dữ liệu câu hỏi
+    char *question = strtok((char *)practice_data, "|");
+    int q_num = 1;
+    
+    // Khởi tạo ExamData cho practice
+    ExamData *practice_data_struct = g_new(ExamData, 1);
+    practice_data_struct->room_id = 0; // 0 để đánh dấu đây là practice
+    practice_data_struct->answers = g_new(Answer, 20);
+    practice_data_struct->answer_count = 0;
+    practice_data_struct->sock = data->sock;
+    practice_data_struct->dialog = dialog;
+
+    while (question != NULL) {
+        // Frame cho mỗi câu hỏi
+        GtkWidget *q_frame = gtk_frame_new(NULL);
+        GtkWidget *q_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+        gtk_widget_set_margin_start(q_box, 10);
+        gtk_widget_set_margin_end(q_box, 10);
+        gtk_widget_set_margin_top(q_box, 10);
+        gtk_widget_set_margin_bottom(q_box, 10);
+
+        // Phân tích thông tin câu hỏi
+        char q_text[256], a1[100], a2[100], a3[100], a4[100];
+        int q_id, a1_id, a2_id, a3_id, a4_id;
+        sscanf(question, "%d;%[^;];%d;%[^;];%d;%[^;];%d;%[^;];%d;%[^;]", 
+               &q_id, q_text, &a1_id, a1, &a2_id, a2, &a3_id, a3, &a4_id, a4);
+
+        // Text câu hỏi
+        char q_label_text[300];
+        snprintf(q_label_text, sizeof(q_label_text), "Câu %d: %s", q_num, q_text);
+        GtkWidget *q_label = gtk_label_new(q_label_text);
+        gtk_label_set_wrap(GTK_LABEL(q_label), TRUE);
+        gtk_label_set_xalign(GTK_LABEL(q_label), 0);
+        gtk_box_append(GTK_BOX(q_box), q_label);
+
+        // Radio buttons cho các đáp án
+        GtkWidget *group = gtk_check_button_new_with_label(a1);
+        gtk_check_button_set_group(GTK_CHECK_BUTTON(group), NULL);
+        
+        GtkWidget *radio2 = gtk_check_button_new_with_label(a2);
+        gtk_check_button_set_group(GTK_CHECK_BUTTON(radio2), GTK_CHECK_BUTTON(group));
+        
+        GtkWidget *radio3 = gtk_check_button_new_with_label(a3);
+        gtk_check_button_set_group(GTK_CHECK_BUTTON(radio3), GTK_CHECK_BUTTON(group));
+        
+        GtkWidget *radio4 = gtk_check_button_new_with_label(a4);
+        gtk_check_button_set_group(GTK_CHECK_BUTTON(radio4), GTK_CHECK_BUTTON(group));
+
+        // Lưu ID đáp án
+        g_object_set_data(G_OBJECT(group), "choice_id", GINT_TO_POINTER(a1_id));
+        g_object_set_data(G_OBJECT(radio2), "choice_id", GINT_TO_POINTER(a2_id));
+        g_object_set_data(G_OBJECT(radio3), "choice_id", GINT_TO_POINTER(a3_id));
+        g_object_set_data(G_OBJECT(radio4), "choice_id", GINT_TO_POINTER(a4_id));
+
+        // Thêm các đáp án vào box
+        gtk_box_append(GTK_BOX(q_box), group);
+        gtk_box_append(GTK_BOX(q_box), radio2);
+        gtk_box_append(GTK_BOX(q_box), radio3);
+        gtk_box_append(GTK_BOX(q_box), radio4);
+
+        gtk_frame_set_child(GTK_FRAME(q_frame), q_box);
+        gtk_box_append(GTK_BOX(questions_box), q_frame);
+
+        // Lưu question_id vào answers array
+        practice_data_struct->answers[practice_data_struct->answer_count].question_id = q_id;
+        practice_data_struct->answers[practice_data_struct->answer_count].selected_choice = -1;
+        practice_data_struct->answer_count++;
+
+        // Kết nối signal cho radio buttons
+        g_signal_connect(group, "toggled", G_CALLBACK(on_answer_selected), 
+                        &practice_data_struct->answers[practice_data_struct->answer_count-1]);
+        g_signal_connect(radio2, "toggled", G_CALLBACK(on_answer_selected), 
+                        &practice_data_struct->answers[practice_data_struct->answer_count-1]);
+        g_signal_connect(radio3, "toggled", G_CALLBACK(on_answer_selected), 
+                        &practice_data_struct->answers[practice_data_struct->answer_count-1]);
+        g_signal_connect(radio4, "toggled", G_CALLBACK(on_answer_selected), 
+                        &practice_data_struct->answers[practice_data_struct->answer_count-1]);
+
+        question = strtok(NULL, "|");
+        q_num++;
+    }
+
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scrolled), questions_box);
+
+    // Thêm vào content area
+    gtk_box_append(GTK_BOX(content_area), header_box);
+    gtk_box_append(GTK_BOX(content_area), scrolled);
+
+    g_signal_connect(dialog, "response", G_CALLBACK(handle_practice_response), practice_data_struct);
+    
+    gtk_window_present(GTK_WINDOW(dialog));
+}
+
+static void start_practice(GtkButton *button, AppData *data) {
+    // Gửi yêu cầu lấy câu hỏi luyện tập
+    char request[MAX_BUFFER] = "GET_PRACTICE_QUESTIONS";
+    send(data->sock, request, strlen(request), 0);
+    
+    // Nhận danh sách câu hỏi
+    char response[MAX_BUFFER];
+    recv(data->sock, response, MAX_BUFFER, 0);
+    
+    // Kiểm tra nếu có lỗi
+    if (strncmp(response, "ERROR:", 6) == 0) {
+        show_error_dialog(response, data);
+        return;
+    }
+    
+    // Kiểm tra và bỏ prefix QUESTIONS:
+    char *practice_data = response;
+    if (strncmp(response, "QUESTIONS:", 10) == 0) {
+        practice_data = response + 10;
+    }
+
+    printf("practice_data: %s\n", practice_data);
+    // Hiển thị giao diện làm bài với time_limit cố định 30 phút
+    show_practice_interface(data, practice_data);
+}
+
+static void show_practice(GtkButton *button, gpointer user_data) {
+    AppData *data = (AppData *)user_data;
+    
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Chế độ luyện tập",
+                                                  GTK_WINDOW(data->main_window),
+                                                  GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+                                                  NULL);
     
     GtkWidget *content_area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
-    GtkWidget *label = gtk_label_new("Chế độ luyện tập sẽ được mở ở đây");
-    gtk_box_append(GTK_BOX(content_area), label);
+    gtk_widget_set_margin_start(content_area, 20);
+    gtk_widget_set_margin_end(content_area, 20);
+    gtk_widget_set_margin_top(content_area, 20);
+    gtk_widget_set_margin_bottom(content_area, 20);
+
+    GtkWidget *message = gtk_label_new("Ấn bắt đầu để bắt đầu chế độ luyện tập.\nChế độ này sẽ có 20 câu hỏi ngẫu nhiên trong 30 phút");
+    gtk_box_append(GTK_BOX(content_area), message);
+
+    GtkWidget *start_button = gtk_button_new_with_label("Bắt đầu");
+    gtk_box_append(GTK_BOX(content_area), start_button);
     
-    g_signal_connect(dialog, "response", G_CALLBACK(dialog_response), NULL);
+    g_signal_connect(start_button, "clicked", G_CALLBACK(start_practice), data);
+    g_signal_connect_swapped(start_button, "clicked", G_CALLBACK(gtk_window_destroy), dialog);
+    
     gtk_window_present(GTK_WINDOW(dialog));
 }
 
@@ -359,8 +904,8 @@ static void create_student_interface(AppData *data) {
     // Connect signals
     g_signal_connect(logout_button, "clicked", G_CALLBACK(logout), data);
     g_signal_connect(exam_button, "clicked", G_CALLBACK(show_exam_list), data);
-    g_signal_connect(history_button, "clicked", G_CALLBACK(show_history), window);
-    g_signal_connect(practice_button, "clicked", G_CALLBACK(show_practice), window);
+    g_signal_connect(history_button, "clicked", G_CALLBACK(show_history), data);
+    g_signal_connect(practice_button, "clicked", G_CALLBACK(show_practice), data);
     
     // Add all components to main box
     gtk_box_append(GTK_BOX(main_box), header_box);
