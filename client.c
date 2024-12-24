@@ -6,7 +6,7 @@
 #include <unistd.h>
 
 #define PORT 8080
-#define MAX_BUFFER 1024
+#define MAX_BUFFER 16384
 
 typedef struct {
     GtkWidget *username_entry;

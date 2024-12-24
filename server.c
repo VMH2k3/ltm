@@ -8,7 +8,7 @@
 #include <sys/select.h>
 
 #define PORT 8080
-#define MAX_BUFFER 1024
+#define MAX_BUFFER 16384
 #define DB_FILE "users.db"
 #define MAX_SESSIONS 100
 
@@ -60,6 +60,12 @@ void init_database() {
                 "question_id INTEGER NOT NULL,"
                 "choice_text TEXT NOT NULL,"
                 "is_correct BOOLEAN NOT NULL DEFAULT 0,"
+                "FOREIGN KEY (question_id) REFERENCES questions(question_id));"
+                "CREATE TABLE IF NOT EXISTS exam_questions ("
+                "exam_question_id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "room_id INTEGER NOT NULL,"
+                "question_id INTEGER NOT NULL,"
+                "FOREIGN KEY (room_id) REFERENCES exam_rooms(room_id),"
                 "FOREIGN KEY (question_id) REFERENCES questions(question_id));"
                 ;
     
@@ -302,20 +308,17 @@ void handle_join_exam(int socket_fd, int room_id) {
     sqlite3_finalize(insert_stmt);
 
     // Lấy danh sách câu hỏi cho phòng thi
-    char *get_questions_sql = "WITH random_questions AS ("
-                             "  SELECT question_id, question_text "
-                             "  FROM questions "
-                             "  ORDER BY RANDOM() "
-                             "  LIMIT 20"
-                             ") "
-                             "SELECT rq.question_id, rq.question_text, "
+    char *get_questions_sql = "SELECT q.question_id, q.question_text, "
                              "GROUP_CONCAT(c.choice_id || ';' || c.choice_text, ';') as choices "
-                             "FROM random_questions rq "
-                             "JOIN choices c ON rq.question_id = c.question_id "
-                             "GROUP BY rq.question_id, rq.question_text;";
+                             "FROM exam_questions eq "
+                             "JOIN questions q ON eq.question_id = q.question_id "
+                             "JOIN choices c ON q.question_id = c.question_id "
+                             "WHERE eq.room_id = ? "
+                             "GROUP BY q.question_id, q.question_text;";
                             
     sqlite3_stmt *q_stmt;
     rc = sqlite3_prepare_v2(db, get_questions_sql, -1, &q_stmt, 0);
+    sqlite3_bind_int(q_stmt, 1, room_id);
     
     char response[MAX_BUFFER] = "QUESTIONS:";
     char temp[256];
