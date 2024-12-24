@@ -830,7 +830,6 @@ static void show_practice(GtkButton *button, gpointer user_data) {
     
     gtk_window_present(GTK_WINDOW(dialog));
 }
-
 static void show_score_list(GtkButton *button, gpointer user_data) {
     AppData *data = (AppData *)user_data;
     
@@ -862,11 +861,15 @@ static void show_score_list(GtkButton *button, gpointer user_data) {
     // Tạo header
     GtkWidget *header_row = gtk_list_box_row_new();
     GtkWidget *header_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    gtk_widget_set_margin_start(header_box, 10);
+    gtk_widget_set_margin_end(header_box, 10);
+    gtk_widget_set_margin_top(header_box, 5);
+    gtk_widget_set_margin_bottom(header_box, 5);
     
-    const char *headers[] = {"Username", "Score", "Start Time"};
-    int widths[] = {200, 100, 200};
+    const char *headers[] = {"Username", "Score", "Start Time", "End Time"};
+    int widths[] = {200, 100, 200, 200};
     
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 4; i++) {
         GtkWidget *label = gtk_label_new(headers[i]);
         gtk_widget_set_size_request(label, widths[i], -1);
         gtk_label_set_xalign(GTK_LABEL(label), 0);
@@ -874,7 +877,7 @@ static void show_score_list(GtkButton *button, gpointer user_data) {
     }
     
     gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(header_row), header_box);
-    gtk_list_box_append(GTK_LIST_BOX(list_box), header_row);
+    gtk_list_box_append(list_box, header_row);
     
     // Gửi request lấy danh sách điểm với room_id
     char request[MAX_BUFFER];
@@ -891,34 +894,40 @@ static void show_score_list(GtkButton *button, gpointer user_data) {
         while (score != NULL) {
             GtkWidget *row = gtk_list_box_row_new();
             GtkWidget *box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+            gtk_widget_set_margin_start(box, 10);
+            gtk_widget_set_margin_end(box, 10);
+            gtk_widget_set_margin_top(box, 5);
+            gtk_widget_set_margin_bottom(box, 5);
             
             char username[50];
-            int score_val;
+            char score_str[20];
             char start_time[50];
+            char end_time[50];
             
-            sscanf(score, "%[^,],%d,%s", username, &score_val, start_time);
+            sscanf(score, "%[^,],%[^,],%[^,],%[^\n]", username, score_str, start_time, end_time);
             
-            // Tạo và thêm các label
             GtkWidget *username_label = gtk_label_new(username);
+            GtkWidget *score_label = gtk_label_new(score_str);
+            GtkWidget *start_label = gtk_label_new(start_time);
+            GtkWidget *end_label = gtk_label_new(end_time);
+            
             gtk_widget_set_size_request(username_label, widths[0], -1);
-            gtk_label_set_xalign(GTK_LABEL(username_label), 0);
-            
-            char score_text[20];
-            snprintf(score_text, sizeof(score_text), "%d", score_val);
-            GtkWidget *score_label = gtk_label_new(score_text);
             gtk_widget_set_size_request(score_label, widths[1], -1);
-            gtk_label_set_xalign(GTK_LABEL(score_label), 0);
+            gtk_widget_set_size_request(start_label, widths[2], -1);
+            gtk_widget_set_size_request(end_label, widths[3], -1);
             
-            GtkWidget *time_label = gtk_label_new(start_time);
-            gtk_widget_set_size_request(time_label, widths[2], -1);
-            gtk_label_set_xalign(GTK_LABEL(time_label), 0);
+            gtk_label_set_xalign(GTK_LABEL(username_label), 0);
+            gtk_label_set_xalign(GTK_LABEL(score_label), 0);
+            gtk_label_set_xalign(GTK_LABEL(start_label), 0);
+            gtk_label_set_xalign(GTK_LABEL(end_label), 0);
             
             gtk_box_append(GTK_BOX(box), username_label);
             gtk_box_append(GTK_BOX(box), score_label);
-            gtk_box_append(GTK_BOX(box), time_label);
+            gtk_box_append(GTK_BOX(box), start_label);
+            gtk_box_append(GTK_BOX(box), end_label);
             
             gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(row), box);
-            gtk_list_box_append(GTK_LIST_BOX(list_box), row);
+            gtk_list_box_append(list_box, row);
             
             score = strtok(NULL, "|");
         }
@@ -935,7 +944,171 @@ static void show_score_list(GtkButton *button, gpointer user_data) {
     g_signal_connect(dialog, "response", G_CALLBACK(gtk_window_destroy), NULL);
     gtk_window_present(GTK_WINDOW(dialog));
 }
-// Sửa lại hàm send_add_room_data
+typedef struct {
+    GtkWidget *dialog;
+    GtkWidget *list_box;
+    int room_id;
+    int sock;
+    AppData *app_data;
+} QuestionsDialogData;
+
+static void save_questions(GtkButton *button, gpointer user_data) {
+    QuestionsDialogData *dialog_data = (QuestionsDialogData *)user_data;
+    
+    // Tạo buffer cho request
+    char request[MAX_BUFFER];
+    snprintf(request, sizeof(request), "UPDATE_ROOM_QUESTIONS|%d", dialog_data->room_id);
+    
+    // Lặp qua tất cả các row trong list box
+    GtkWidget *child = gtk_widget_get_first_child(GTK_WIDGET(dialog_data->list_box));
+    while (child != NULL) {
+        if (GTK_IS_LIST_BOX_ROW(child)) {
+            GtkWidget *box = gtk_list_box_row_get_child(GTK_LIST_BOX_ROW(child));
+            GtkWidget *check_button = gtk_widget_get_first_child(box);
+            
+            // Lấy question_id và trạng thái của checkbox
+            int question_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(check_button), "question_id"));
+            int is_selected = gtk_check_button_get_active(GTK_CHECK_BUTTON(check_button));
+            
+            // Thêm vào request
+            char temp[32];
+            snprintf(temp, sizeof(temp), "|%d,%d", question_id, is_selected);
+            strcat(request, temp);
+        }
+        child = gtk_widget_get_next_sibling(child);
+    }
+    
+    // Gửi request lên server
+    send(dialog_data->sock, request, strlen(request), 0);
+    
+    // Nhận response
+    char response[MAX_BUFFER];
+    recv(dialog_data->sock, response, MAX_BUFFER, 0);
+    
+    // Hiển thị thông báo kết quả
+    GtkWidget *message_dialog;
+    if (strncmp(response, "SUCCESS:",8) == 0) {
+        message_dialog = gtk_message_dialog_new(GTK_WINDOW(dialog_data->dialog),
+                                              GTK_DIALOG_MODAL,
+                                              GTK_MESSAGE_INFO,
+                                              GTK_BUTTONS_OK,
+                                              "Lưu thành công!");
+    } else {
+        message_dialog = gtk_message_dialog_new(GTK_WINDOW(dialog_data->dialog),
+                                              GTK_DIALOG_MODAL,
+                                              GTK_MESSAGE_ERROR,
+                                              GTK_BUTTONS_OK,
+                                              "Lỗi: %s", response + 6);
+    }
+    
+    gtk_window_present(GTK_WINDOW(message_dialog));
+    g_signal_connect(message_dialog, "response", G_CALLBACK(gtk_window_destroy), NULL);
+}
+
+static void handle_questions_dialog_response(GtkDialog *dialog, gint response_id, gpointer user_data) {
+    QuestionsDialogData *dialog_data = (QuestionsDialogData *)user_data;
+    
+    if (response_id == GTK_RESPONSE_ACCEPT) {
+        save_questions(NULL, dialog_data);
+    }
+    
+    g_free(dialog_data);
+    gtk_window_destroy(GTK_WINDOW(dialog));
+}
+
+
+static void show_questions_list(GtkButton *button, gpointer user_data) {
+    AppData *data = (AppData *)user_data;
+    int room_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "room_id"));
+    
+    // Tạo dialog
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Danh sách câu hỏi",
+                                                   GTK_WINDOW(data->main_window),
+                                                   GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+                                                   "_Lưu",
+                                                   GTK_RESPONSE_ACCEPT,
+                                                   "_Đóng",
+                                                   GTK_RESPONSE_CLOSE,
+                                                   NULL);
+    gtk_window_set_default_size(GTK_WINDOW(dialog), 800, 600);
+    
+    GtkWidget *content_area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    gtk_widget_set_margin_start(content_area, 10);
+    gtk_widget_set_margin_end(content_area, 10);
+    gtk_widget_set_margin_top(content_area, 10);
+    gtk_widget_set_margin_bottom(content_area, 10);
+    
+    // Tạo list box
+    GtkWidget *list_box = gtk_list_box_new();
+    
+    // Tạo QuestionsDialogData
+    QuestionsDialogData *dialog_data = g_new(QuestionsDialogData, 1);
+    dialog_data->dialog = dialog;
+    dialog_data->list_box = list_box;
+    dialog_data->room_id = room_id;
+    dialog_data->sock = data->sock;
+    dialog_data->app_data = data;
+    
+    // Lấy danh sách câu hỏi từ server
+    char request[MAX_BUFFER];
+    snprintf(request, sizeof(request), "GET_ROOM_QUESTIONS|%d", room_id);
+    send(data->sock, request, strlen(request), 0);
+    
+    char response[MAX_BUFFER];
+    recv(data->sock, response, MAX_BUFFER, 0);
+    
+    if (strncmp(response, "QUESTIONS:", 10) == 0) {
+        char *questions = response + 10;
+        char *question = strtok(questions, "|");
+        
+        while (question != NULL) {
+            int id, difficulty, is_selected;
+            char q_text[256];
+            sscanf(question, "%d,%[^,],%d,%d", &id, q_text, &difficulty, &is_selected);
+            
+            // Tạo row mới
+            GtkWidget *row = gtk_list_box_row_new();
+            GtkWidget *box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+            
+            // Tạo checkbox
+            GtkWidget *check_button = gtk_check_button_new();
+            g_object_set_data(G_OBJECT(check_button), "question_id", GINT_TO_POINTER(id));
+            gtk_check_button_set_active(GTK_CHECK_BUTTON(check_button), is_selected);
+            
+            // Tạo label cho câu hỏi
+            char label_text[512];
+            snprintf(label_text, sizeof(label_text), "%s (Độ khó: %d)", q_text, difficulty);
+            GtkWidget *label = gtk_label_new(label_text);
+            gtk_label_set_wrap(GTK_LABEL(label), TRUE);
+            gtk_widget_set_hexpand(label, TRUE);
+            gtk_label_set_xalign(GTK_LABEL(label), 0);
+            
+            // Thêm widgets vào box
+            gtk_box_append(GTK_BOX(box), check_button);
+            gtk_box_append(GTK_BOX(box), label);
+            
+            gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(row), box);
+            gtk_list_box_append(GTK_LIST_BOX(list_box), row);
+            
+            question = strtok(NULL, "|");
+        }
+    }
+    
+    // Thêm list box vào scrolled window
+    GtkWidget *scrolled = gtk_scrolled_window_new();
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scrolled), list_box);
+    gtk_scrolled_window_set_min_content_height(GTK_SCROLLED_WINDOW(scrolled), 400);
+    
+    // Thêm scrolled window vào content area
+    gtk_box_append(GTK_BOX(content_area), scrolled);
+    
+    // Kết nối signals
+    g_signal_connect(dialog, "response", G_CALLBACK(handle_questions_dialog_response), dialog_data);
+    
+    gtk_window_present(GTK_WINDOW(dialog));
+}
+
+
 static void send_add_room_data(GtkButton *button, gpointer user_data) {
     AddRoomData *data = (AddRoomData *)user_data;
     
@@ -1158,13 +1331,13 @@ static void show_room_list(GtkButton *button, gpointer user_data) {
                &room_id, room_name, status, &time_limit, start_time, end_time);
         
         // Tạo row cho mỗi phòng thi
-        GtkWidget *row = gtk_list_box_row_new();
-        GtkWidget *box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 20);
-        gtk_widget_set_margin_start(box, 10);
-        gtk_widget_set_margin_end(box, 10);
-        gtk_widget_set_margin_top(box, 5);
-        gtk_widget_set_margin_bottom(box, 5);
-        
+            GtkWidget *row = gtk_list_box_row_new();
+            GtkWidget *box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 20);
+            gtk_widget_set_margin_start(box, 10);
+            gtk_widget_set_margin_end(box, 10);
+            gtk_widget_set_margin_top(box, 5);
+            gtk_widget_set_margin_bottom(box, 5);
+
         // Tạo và định dạng các label
         GtkWidget *name_label = gtk_label_new(room_name);
         gtk_widget_set_size_request(name_label, 200, -1);
@@ -1178,25 +1351,31 @@ static void show_room_list(GtkButton *button, gpointer user_data) {
         GtkWidget *time_label = gtk_label_new(time_text);
         gtk_widget_set_size_request(time_label, 80, -1);
         
-        GtkWidget *start_label = gtk_label_new(start_time);
+            GtkWidget *start_label = gtk_label_new(start_time);
         gtk_widget_set_size_request(start_label, 150, -1);
         
-        GtkWidget *end_label = gtk_label_new(end_time);
+            GtkWidget *end_label = gtk_label_new(end_time);
         gtk_widget_set_size_request(end_label, 150, -1);
         
         GtkWidget *show_score_button = gtk_button_new_with_label("See Score");
+        GtkWidget *show_question_button = gtk_button_new_with_label("Question List");
         
         // Thêm các widget vào box
         gtk_box_append(GTK_BOX(box), name_label);
         gtk_box_append(GTK_BOX(box), status_label);
         gtk_box_append(GTK_BOX(box), time_label);
-        gtk_box_append(GTK_BOX(box), start_label);
+            gtk_box_append(GTK_BOX(box), start_label);
         gtk_box_append(GTK_BOX(box), end_label);
         gtk_box_append(GTK_BOX(box), show_score_button);
+        gtk_box_append(GTK_BOX(box), show_question_button);
         
         // Lưu room_id vào button để sử dụng khi click
         g_object_set_data(G_OBJECT(show_score_button), "room_id", GINT_TO_POINTER(room_id));
         g_signal_connect(show_score_button, "clicked", G_CALLBACK(show_score_list), data);
+        
+        // Thêm signal handler cho nút Question List
+        g_object_set_data(G_OBJECT(show_question_button), "room_id", GINT_TO_POINTER(room_id));
+        g_signal_connect(show_question_button, "clicked", G_CALLBACK(show_questions_list), data);
         
         gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(row), box);
         gtk_list_box_append(list_box, GTK_LIST_BOX_ROW(row));
@@ -1229,7 +1408,6 @@ static void show_room_list(GtkButton *button, gpointer user_data) {
     g_signal_connect(dialog, "response", G_CALLBACK(gtk_window_destroy), NULL);
     gtk_window_present(GTK_WINDOW(dialog));
 }
-
 
 static void show_stats(GtkButton *button, gpointer user_data) {
     GtkWidget *dialog = gtk_dialog_new_with_buttons("Thông báo",
