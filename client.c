@@ -5,10 +5,11 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 
-#define PORT 8080
 #define MAX_BUFFER 16384
 
 typedef struct {
+    char server_ip[16]; 
+    int server_port;
     GtkWidget *username_entry;
     GtkWidget *password_entry;
     GtkWidget *status_label;
@@ -45,6 +46,38 @@ typedef struct {
     int sock;
 } ExamData;
 
+// Tạo struct để truyền dữ liệu qua callback
+typedef struct {
+    int question_id;
+    AppData *app_data;
+    GtkWidget *window;
+    int sock;
+} DeleteUpdateData;
+
+// Cấu trúc cho dữ liệu câu hỏi
+typedef struct {
+    int question_id;
+    GtkWidget *question_text;
+    GtkWidget *difficulty;
+    struct {
+        int choice_id;
+        GtkWidget *choice_text;
+        GtkWidget *is_correct;
+    } choices[4];
+    GtkWidget *window;
+    AppData *app_data;
+    int sock;
+} Question;
+
+// Khai báo các hàm
+static void handle_question_dialog_response(GtkDialog *dialog, gint response_id, gpointer user_data);
+static void handle_delete_response(GtkDialog *dialog, gint response_id, gpointer user_data);
+static void show_question_dialog(GtkButton *button, gpointer user_data);
+static void edit_question(GtkButton *button, gpointer user_data);
+static void delete_question(GtkButton *button, gpointer user_data);
+static void load_questions(GtkListBox *list_box, AppData *data);
+static void show_update_question(GtkButton *button, gpointer user_data);
+
 static void logout(GtkWidget *button, AppData *data) {
     // Gửi thông báo logout đến server
     send(data->sock, "LOGOUT", 6, 0);
@@ -56,9 +89,16 @@ static void logout(GtkWidget *button, AppData *data) {
     data->sock = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in serv_addr;
     serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(PORT);
-    inet_pton(AF_INET, "127.0.0.1", &serv_addr.sin_addr);
-    connect(data->sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr));
+    serv_addr.sin_port = htons(data->server_port);
+    if (inet_pton(AF_INET, data->server_ip, &serv_addr.sin_addr) <= 0) {
+        printf("Địa chỉ IP không hợp lệ\n");
+        return;
+    }
+    
+    if (connect(data->sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+        printf("Không thể kết nối lại đến server\n");
+        return;
+    }
     
     // Đóng cửa sổ chính và hiển thị cửa sổ đăng nhập
     gtk_window_destroy(GTK_WINDOW(data->main_window));
@@ -67,6 +107,22 @@ static void logout(GtkWidget *button, AppData *data) {
 
 static void dialog_response(GtkDialog *dialog, gint response_id, gpointer user_data) {
     gtk_window_destroy(GTK_WINDOW(dialog));
+}
+
+static gboolean show_success_dialog(const char *message, AppData *data) {
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Thành công",
+                                                   GTK_WINDOW(data->main_window),
+                                                   GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+                                                   "_OK",
+                                                   GTK_RESPONSE_ACCEPT,
+                                                   NULL);
+    GtkWidget *content_area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *label = gtk_label_new(message + 8); 
+    gtk_box_append(GTK_BOX(content_area), label);
+
+    g_signal_connect(dialog, "response", G_CALLBACK(gtk_window_destroy), NULL);
+    gtk_window_present(GTK_WINDOW(dialog));
+    return TRUE;
 }
 
 static gboolean show_error_dialog(const char *message, AppData *data) {
@@ -838,19 +894,443 @@ static void show_room_list(GtkButton *button, gpointer user_data) {
     gtk_window_present(GTK_WINDOW(dialog));
 }
 
-static void show_stats(GtkButton *button, gpointer user_data) {
-    GtkWidget *dialog = gtk_dialog_new_with_buttons("Thông báo",
-                                                   GTK_WINDOW(user_data),
-                                                   GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
-                                                   "_OK",
-                                                   GTK_RESPONSE_ACCEPT,
-                                                   NULL);
+// Hàm để load danh sách câu hỏi từ server
+static void load_questions(GtkListBox *list_box, AppData *data) {
+    send(data->sock, "GET_QUESTIONS", strlen("GET_QUESTIONS"), 0);
     
-    GtkWidget *content_area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
-    GtkWidget *label = gtk_label_new("Thống kê điểm theo phòng sẽ được mở ở đây");
-    gtk_box_append(GTK_BOX(content_area), label);
+    char response[MAX_BUFFER];
+    recv(data->sock, response, MAX_BUFFER, 0);
     
-    g_signal_connect(dialog, "response", G_CALLBACK(dialog_response), NULL);
+    // Xóa tất cả các row hiện tại
+    GtkWidget *child;
+    while ((child = gtk_list_box_get_row_at_index(list_box, 0)) != NULL) {
+        gtk_list_box_remove(list_box, child);
+    }
+    
+    if (strncmp(response, "QUESTIONS:", 10) == 0) {
+        char *questions_data = response + 10;
+        char *question = strtok(questions_data, "|");
+        
+        while (question != NULL) {
+            // Parse thông tin câu hỏi
+            int id;
+            char text[512];
+            int difficulty;
+            sscanf(question, "%d,%[^,],%d", &id, text, &difficulty);
+            
+            // Tạo box chứa thông tin câu hỏi
+            GtkWidget *row = gtk_list_box_row_new();
+            GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+            gtk_widget_set_margin_start(hbox, 10);
+            gtk_widget_set_margin_end(hbox, 10);
+            gtk_widget_set_margin_top(hbox, 5);
+            gtk_widget_set_margin_bottom(hbox, 5);
+            
+            // Label hiển thị thông tin
+            char display_text[600];
+            snprintf(display_text, sizeof(display_text), "ID: %d - %s (Độ khó: %d)", 
+                    id, text, difficulty);
+            GtkWidget *label = gtk_label_new(display_text);
+            gtk_label_set_xalign(GTK_LABEL(label), 0);
+            gtk_widget_set_hexpand(label, TRUE);
+            
+            // Nút sửa và xóa
+            GtkWidget *edit_btn = gtk_button_new_with_label("Sửa");
+            GtkWidget *delete_btn = gtk_button_new_with_label("Xóa");
+            
+            // Thêm các widget vào hbox
+            gtk_box_append(GTK_BOX(hbox), label);
+            gtk_box_append(GTK_BOX(hbox), edit_btn);
+            gtk_box_append(GTK_BOX(hbox), delete_btn);
+            
+            gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(row), hbox);
+            gtk_list_box_append(list_box, GTK_LIST_BOX_ROW(row));
+            DeleteUpdateData *del_update_data = g_new(DeleteUpdateData, 1);
+            del_update_data->window = data->main_window;
+            del_update_data->sock = data->sock;
+            del_update_data->app_data = data;
+            del_update_data->question_id = id;
+            
+            // Kết nối signals cho các nút
+            g_signal_connect(edit_btn, "clicked", G_CALLBACK(show_update_question), 
+                           del_update_data);
+            g_signal_connect(delete_btn, "clicked", G_CALLBACK(delete_question), 
+                           del_update_data);
+            
+            question = strtok(NULL, "|");
+        }
+    }
+}
+
+static void handle_update_question_response(GtkDialog *dialog, gint response_id, gpointer user_data) {
+    if (response_id == GTK_RESPONSE_ACCEPT) {
+        Question *question = (Question *)user_data;
+        const char* question_text = gtk_editable_get_text(GTK_EDITABLE(question->question_text));
+        int difficulty = gtk_combo_box_get_active(GTK_COMBO_BOX(question->difficulty));
+        
+        char request[MAX_BUFFER];
+        snprintf(request, sizeof(request), "UPDATE_QUESTION|%d|%s|%d", 
+                question->question_id, question_text, difficulty);
+
+        for (int i = 0; i < 4; i++) {
+            const char* choice_text = gtk_editable_get_text(GTK_EDITABLE(question->choices[i].choice_text));
+            int is_correct = gtk_check_button_get_active(GTK_CHECK_BUTTON(question->choices[i].is_correct));
+            char choice_data[256];
+            snprintf(choice_data, sizeof(choice_data), "|%d|%s|%d", 
+                    question->choices[i].choice_id, choice_text, is_correct);
+            strcat(request, choice_data);
+        }
+
+        send(question->sock, request, strlen(request), 0);
+        printf("request: %s\n", request);
+        
+        char response[MAX_BUFFER];
+        recv(question->sock, response, MAX_BUFFER, 0);
+        
+        if (strncmp(response, "ERROR:", 6) == 0) {
+            show_error_dialog(response, question->app_data);
+        } else if (strncmp(response, "SUCCESS:", 8) == 0) {
+            show_success_dialog(response, question->app_data);
+        }
+    }
+    
+    gtk_window_destroy(GTK_WINDOW(dialog));
+    g_free(user_data);
+}
+
+static void show_update_question(GtkButton *button, gpointer user_data) {
+    DeleteUpdateData *update_data = (DeleteUpdateData *)user_data;
+    
+    // Gửi yêu cầu lấy thông tin câu hỏi
+    char request[32];
+    snprintf(request, sizeof(request), "GET_QUESTION|%d", update_data->question_id);
+    send(update_data->sock, request, strlen(request), 0);
+    
+    char response[MAX_BUFFER];
+    recv(update_data->sock, response, MAX_BUFFER, 0);
+    
+    if (strncmp(response, "ERROR:", 6) == 0) {
+        show_error_dialog(response, update_data->app_data);
+        return;
+    }
+    
+    if (strncmp(response, "QUESTION:", 9) == 0) {
+        printf("response: %s\n", response);
+        char *q_data = response + 9;
+        int question_id = atoi(strtok(q_data, ";"));
+        char *question_text = strtok(NULL, ";");
+        char *difficulty = atoi(strtok(NULL, ";"));
+        int choice_id[4];
+        char *choices[4];
+        int *is_correct[4];
+        for (int i = 0; i < 4; i++) {
+            choice_id[i] = atoi(strtok(NULL, ";"));
+            choices[i] = strtok(NULL, ";");
+            is_correct[i] = atoi(strtok(NULL, ";"));
+        }
+        
+        // Tạo dialog
+        GtkWidget *dialog = gtk_dialog_new_with_buttons(
+            "Cập nhật câu hỏi",
+            GTK_WINDOW(update_data->window),
+            GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+            "_Hủy",
+            GTK_RESPONSE_CANCEL,
+            "_Lưu",
+            GTK_RESPONSE_ACCEPT,
+            NULL);
+
+        // Tạo container chính
+        GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+        gtk_widget_set_margin_start(content, 20);
+        gtk_widget_set_margin_end(content, 20);
+        gtk_widget_set_margin_top(content, 20);
+        gtk_widget_set_margin_bottom(content, 20);
+
+        // Box cho câu hỏi
+        GtkWidget *question_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+        GtkWidget *q_label = gtk_label_new("Câu hỏi:");
+        GtkWidget *q_entry = gtk_entry_new();
+        gtk_editable_set_text(GTK_EDITABLE(q_entry), (const char*)question_text);
+
+        // Box cho độ khó
+        GtkWidget *diff_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+        GtkWidget *diff_label = gtk_label_new("Độ khó:");
+        GtkWidget *diff_combo = gtk_combo_box_text_new();
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(diff_combo), "Dễ");
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(diff_combo), "Trung bình");
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(diff_combo), "Khó");
+        gtk_combo_box_set_active(GTK_COMBO_BOX(diff_combo), difficulty - 1);
+
+        // Box cho các đáp án
+        GtkWidget *choices_label = gtk_label_new("Các đáp án:");
+        GtkWidget *choices_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+
+        // Tạo entries và checkboxes cho 4 đáp án
+        GtkWidget *choice_entries[4];
+        GtkWidget *correct_checks[4];
+
+        for (int i = 0; i < 4; i++) {
+            GtkWidget *choice_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+            
+            choice_entries[i] = gtk_entry_new();
+            gtk_editable_set_text(GTK_EDITABLE(choice_entries[i]), 
+                            (const char*)choices[i]);
+            
+            correct_checks[i] = gtk_check_button_new_with_label("Đáp án đúng");
+            gtk_check_button_set_active(GTK_CHECK_BUTTON(correct_checks[i]), 
+                                    is_correct[i]);
+            
+            gtk_box_append(GTK_BOX(choice_box), choice_entries[i]);
+            gtk_box_append(GTK_BOX(choice_box), correct_checks[i]);
+            gtk_box_append(GTK_BOX(choices_box), choice_box);
+        }
+
+        // Thêm các widget vào dialog
+        gtk_box_append(GTK_BOX(question_box), q_label);
+        gtk_box_append(GTK_BOX(question_box), q_entry);
+        gtk_box_append(GTK_BOX(diff_box), diff_label);
+        gtk_box_append(GTK_BOX(diff_box), diff_combo);
+        gtk_box_append(GTK_BOX(content), question_box);
+        gtk_box_append(GTK_BOX(content), diff_box);
+        gtk_box_append(GTK_BOX(content), choices_label);
+        gtk_box_append(GTK_BOX(content), choices_box);
+
+        gtk_window_set_default_size(GTK_WINDOW(dialog), 800, 600);
+
+        // Tạo struct để lưu thông tin câu hỏi
+        Question *updated_question = g_new(Question, 1);
+        updated_question->question_id = question_id;
+        updated_question->question_text = q_entry;
+        updated_question->difficulty = diff_combo;
+
+        for (int i = 0; i < 4; i++) {
+            updated_question->choices[i].choice_id = choice_id[i];
+            updated_question->choices[i].choice_text = choice_entries[i];
+            updated_question->choices[i].is_correct = correct_checks[i];
+        }
+
+        updated_question->window = update_data->window;
+        updated_question->sock = update_data->sock;
+        updated_question->app_data = update_data->app_data;
+
+        // Kết nối signal cho dialog
+        g_signal_connect(dialog, "response", G_CALLBACK(handle_update_question_response), updated_question);
+
+        gtk_window_present(GTK_WINDOW(dialog));
+    }
+}
+
+// Hàm hiển thị dialog thêm/sửa câu hỏi
+static void show_question_dialog(GtkButton *button, gpointer user_data) {
+    AppData *data = (AppData *)user_data;
+    GtkWidget *dialog = gtk_dialog_new_with_buttons(
+        "Thêm câu hỏi mới",
+        GTK_WINDOW(data->main_window),
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        "_Lưu",
+        GTK_RESPONSE_ACCEPT,
+        "_Hủy",
+        GTK_RESPONSE_CANCEL,
+        NULL);
+        
+    GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    gtk_widget_set_margin_start(content, 20);
+    gtk_widget_set_margin_end(content, 20);
+    gtk_widget_set_margin_top(content, 20);
+    gtk_widget_set_margin_bottom(content, 20);
+    
+    // Box cho câu hỏi
+    GtkWidget *question_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+    GtkWidget *q_label = gtk_label_new("Câu hỏi:");
+    gtk_label_set_xalign(GTK_LABEL(q_label), 0);
+
+    GtkWidget *q_entry = gtk_entry_new();
+
+    // Combobox độ khó
+    GtkWidget *diff_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+    GtkWidget *diff_label = gtk_label_new("Độ khó:");
+    GtkWidget *diff_combo = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(diff_combo), "Dễ");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(diff_combo), "Trung bình");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(diff_combo), "Khó");
+    gtk_combo_box_set_active(GTK_COMBO_BOX(diff_combo), 0);
+
+    // Box cho các đáp án
+    GtkWidget *choices_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    GtkWidget *choices_label = gtk_label_new("Các đáp án:");
+    gtk_label_set_xalign(GTK_LABEL(choices_label), 0);
+    
+    GtkWidget *choice_entries[4];
+    GtkWidget *correct_checks[4];
+    
+    for (int i = 0; i < 4; i++) {
+        GtkWidget *choice_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+        choice_entries[i] = gtk_entry_new();
+        correct_checks[i] = gtk_check_button_new_with_label("Đáp án đúng");
+        gtk_box_append(GTK_BOX(choice_box), choice_entries[i]);
+        gtk_box_append(GTK_BOX(choice_box), correct_checks[i]);
+        gtk_box_append(GTK_BOX(choices_box), choice_box);
+    }
+    
+    // Thêm tất cả vào dialog
+    gtk_box_append(GTK_BOX(question_box), q_label);
+    gtk_box_append(GTK_BOX(question_box), q_entry);
+    gtk_box_append(GTK_BOX(diff_box), diff_label);
+    gtk_box_append(GTK_BOX(diff_box), diff_combo);
+    gtk_box_append(GTK_BOX(content), question_box);
+    gtk_box_append(GTK_BOX(content), diff_box);
+    gtk_box_append(GTK_BOX(content), choices_label);
+    gtk_box_append(GTK_BOX(content), choices_box);
+    
+    gtk_box_append(GTK_BOX(content), question_box);
+    gtk_window_set_default_size(GTK_WINDOW(dialog), 1200, 800);
+
+    Question *question = g_new(Question, 1);
+    // đưa hết data đọc được vào question
+    question->question_id = -1;
+    question->question_text = q_entry;
+    question->difficulty = diff_combo;
+
+    for (int i = 0; i < 4; i++) {
+        question->choices[i].choice_id = -1;
+        question->choices[i].choice_text = choice_entries[i];
+        question->choices[i].is_correct = correct_checks[i];
+    }
+
+    question->window = GTK_WINDOW(dialog);
+    question->sock = data->sock;
+    question->app_data = data;
+
+    g_signal_connect(dialog, "response", G_CALLBACK(handle_question_dialog_response), question);
+    
+    gtk_window_present(GTK_WINDOW(dialog));
+}
+
+// Hàm xử lý khi nhấn nút xóa câu hỏi
+static void delete_question(GtkButton *button, gpointer user_data) {
+    DeleteUpdateData *del_data = (DeleteUpdateData *)user_data;
+    
+    // Hiển thị dialog xác nhận
+    GtkWidget *confirm_dialog = gtk_dialog_new_with_buttons(
+        "Xác nhận xóa",
+        GTK_WINDOW(del_data->window),
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        "_Hủy",
+        GTK_RESPONSE_CANCEL,
+        "_Xóa",
+        GTK_RESPONSE_ACCEPT,
+        NULL);
+        
+    GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(confirm_dialog));
+    GtkWidget *label = gtk_label_new("Bạn có chắc chắn muốn xóa câu hỏi này?");
+    gtk_box_append(GTK_BOX(content), label);
+        
+    g_signal_connect(confirm_dialog, "response", G_CALLBACK(handle_delete_response), del_data);
+    
+    gtk_window_present(GTK_WINDOW(confirm_dialog));
+}
+
+// Thêm hàm callback mới để xử lý response của dialog xóa
+static void handle_delete_response(GtkDialog *dialog, gint response_id, gpointer user_data) {
+    DeleteUpdateData *del_data = (DeleteUpdateData *)user_data;
+    
+    if (response_id == GTK_RESPONSE_ACCEPT) {
+        // Gửi yêu cầu xóa câu hỏi
+        char request[32];
+        snprintf(request, sizeof(request), "DELETE_QUESTION|%d", del_data->question_id);
+        send(del_data->app_data->sock, request, strlen(request), 0);
+        
+        char response[MAX_BUFFER];
+        recv(del_data->app_data->sock, response, MAX_BUFFER, 0);
+        
+        if (strncmp(response, "ERROR:", 6) == 0) {
+            show_error_dialog(response, del_data->app_data);
+        } else if (strncmp(response, "SUCCESS:", 8) == 0) {
+            show_success_dialog(response, del_data->app_data);
+        }
+    }
+    
+    g_free(del_data);
+    gtk_window_destroy(GTK_WINDOW(dialog));
+}
+
+// Hàm xử lý khi nhấn nút Lưu trong dialog thêm/sửa câu hỏi
+static void handle_question_dialog_response(GtkDialog *dialog, gint response_id, gpointer user_data) {
+    if (response_id == GTK_RESPONSE_ACCEPT) {
+        Question *question = (Question *)user_data;
+        const char* question_text = gtk_editable_get_text(GTK_EDITABLE(question->question_text));
+        int difficulty = gtk_combo_box_get_active(GTK_COMBO_BOX(question->difficulty));
+        char request[MAX_BUFFER];
+        snprintf(request, sizeof(request), "ADD_QUESTION|%s|%d", question_text, difficulty);
+
+        for (int i = 0; i < 4; i++) {
+            const char* choice_text = gtk_editable_get_text(GTK_EDITABLE(question->choices[i].choice_text));
+            int is_correct = gtk_check_button_get_active(GTK_CHECK_BUTTON(question->choices[i].is_correct));
+            const char* choice_data[256];
+            snprintf(choice_data, sizeof(choice_data), "|%s|%d", choice_text, is_correct);
+            strcat(request, choice_data);
+        }
+        
+        // Gửi yêu cầu lên server
+        send(question->sock, request, strlen(request), 0);
+        printf("Send request: %s to server %d\n", request, question->sock);
+        
+        char response[MAX_BUFFER];
+        recv(question->sock, response, MAX_BUFFER, 0);
+        
+        if (strncmp(response, "ERROR:", 6) == 0) {
+            show_error_dialog(response, question->app_data);
+        } else if (strncmp(response, "SUCCESS:", 8) == 0) {
+            show_success_dialog(response, question->app_data);
+        }
+    }
+    gtk_window_destroy(GTK_WINDOW(dialog));
+}
+
+// Hàm chính để hiển thị CRUD câu hỏi
+static void show_crud_question(GtkButton *button, gpointer user_data) {
+    AppData *data = (AppData *)user_data;
+    
+    GtkWidget *dialog = gtk_dialog_new_with_buttons(
+        "Quản lý câu hỏi",
+        GTK_WINDOW(data->main_window),
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        "_Đóng",
+        GTK_RESPONSE_CLOSE,
+        NULL);
+    gtk_window_set_default_size(GTK_WINDOW(dialog), 1600, 800);
+    
+    GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    gtk_widget_set_margin_start(content, 20);
+    gtk_widget_set_margin_end(content, 20);
+    gtk_widget_set_margin_top(content, 20);
+    gtk_widget_set_margin_bottom(content, 20);
+    
+    // Header với nút thêm mới
+    GtkWidget *header_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    GtkWidget *add_btn = gtk_button_new_with_label("Thêm câu hỏi mới");
+    gtk_widget_set_halign(add_btn, GTK_ALIGN_END);
+    gtk_box_append(GTK_BOX(header_box), add_btn);
+    
+    // Danh sách câu hỏi
+    GtkWidget *scrolled = gtk_scrolled_window_new();
+    gtk_scrolled_window_set_min_content_height(GTK_SCROLLED_WINDOW(scrolled), 680);
+    GtkWidget *list_box = gtk_list_box_new();
+    
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scrolled), list_box);
+    
+    // Thêm vào dialog
+    gtk_box_append(GTK_BOX(content), header_box);
+    gtk_box_append(GTK_BOX(content), scrolled);
+    
+    // Load danh sách câu hỏi
+    load_questions(GTK_LIST_BOX(list_box), data);
+    
+    // Kết nối signals
+    g_signal_connect(add_btn, "clicked", G_CALLBACK(show_question_dialog), data);
+    g_signal_connect(dialog, "response", G_CALLBACK(gtk_window_destroy), NULL);
+    
     gtk_window_present(GTK_WINDOW(dialog));
 }
 
@@ -952,7 +1432,7 @@ static void create_teacher_interface(AppData *data) {
     
     // Create three main option buttons
     GtkWidget *room_button = gtk_button_new_with_label("Quản lý phòng thi");
-    GtkWidget *grade_button = gtk_button_new_with_label("Xem điểm phòng thi");
+    GtkWidget *grade_button = gtk_button_new_with_label("Quản lý câu hỏi");
     
     // Set size for buttons
     gtk_widget_set_size_request(room_button, 400, 400);
@@ -964,8 +1444,8 @@ static void create_teacher_interface(AppData *data) {
     
     // Connect signals
     g_signal_connect(logout_button, "clicked", G_CALLBACK(logout), data);
-    g_signal_connect(room_button, "clicked", G_CALLBACK(show_room_list), window);
-    g_signal_connect(grade_button, "clicked", G_CALLBACK(show_stats), window);
+    g_signal_connect(room_button, "clicked", G_CALLBACK(show_room_list), data);
+    g_signal_connect(grade_button, "clicked", G_CALLBACK(show_crud_question), data);
     
     // Add all components to main box
     gtk_box_append(GTK_BOX(main_box), header_box);
@@ -1094,10 +1574,28 @@ static void open_register_window(GtkButton *button, AppData *data) {
 
 // Sửa đổi hàm activate để thêm nút đăng ký
 static void activate(GtkApplication *app, gpointer user_data) {
+    AppData *data = (AppData *)user_data;
     // Create main window
     GtkWidget *window = gtk_application_window_new(app);
     gtk_window_set_title(GTK_WINDOW(window), "Login Application");
     gtk_window_set_default_size(GTK_WINDOW(window), 800, 480);
+    data->window = window;
+
+     // Create socket connection
+    data->sock = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in serv_addr;
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(data->server_port);
+    
+    if (inet_pton(AF_INET, data->server_ip, &serv_addr.sin_addr) <= 0) {
+        printf("Địa chỉ IP không hợp lệ\n");
+        return;
+    }
+    
+    if (connect(data->sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+        printf("Không thể kết nối đến server\n");
+        return;
+    }
     
     // Create layout box
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
@@ -1105,18 +1603,6 @@ static void activate(GtkApplication *app, gpointer user_data) {
     gtk_widget_set_margin_end(box, 200);
     gtk_widget_set_margin_top(box, 20);
     gtk_widget_set_margin_bottom(box, 20);
-    
-    // Create AppData structure
-    AppData *data = g_new(AppData, 1);
-    data->window = window;
-    
-    // Create socket connection
-    data->sock = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in serv_addr;
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(PORT);
-    inet_pton(AF_INET, "127.0.0.1", &serv_addr.sin_addr);
-    connect(data->sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr));
     
     // Create widgets
     GtkWidget *username_label = gtk_label_new("Username:");
@@ -1149,9 +1635,25 @@ static void activate(GtkApplication *app, gpointer user_data) {
 }
 
 int main(int argc, char *argv[]) {
-    GtkApplication *app = gtk_application_new("com.example.login", G_APPLICATION_FLAGS_NONE);
-    g_signal_connect(app, "activate", G_CALLBACK(activate), NULL);
-    int status = g_application_run(G_APPLICATION(app), argc, argv);
+    if (argc != 3) {
+        printf("Sử dụng: %s <server_ip> <port>\n", argv[0]);
+        return 1;
+    }
+
+    int port = atoi(argv[2]);
+    if (port <= 0 || port > 65535) {
+        printf("Port không hợp lệ. Vui lòng sử dụng port từ 1-65535\n");
+        return 1;
+    }
+
+    AppData *data = g_new(AppData, 1);
+    strncpy(data->server_ip, argv[1], sizeof(data->server_ip) - 1);
+    data->server_ip[sizeof(data->server_ip) - 1] = '\0';
+    data->server_port = port;
+
+    GtkApplication *app = gtk_application_new("com.example.login", G_APPLICATION_NON_UNIQUE);
+    g_signal_connect(app, "activate", G_CALLBACK(activate), data);
+    int status = g_application_run(G_APPLICATION(app), 0, NULL);
     g_object_unref(app);
     return status;
 }

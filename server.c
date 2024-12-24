@@ -7,7 +7,6 @@
 #include <sqlite3.h>
 #include <sys/select.h>
 
-#define PORT 8080
 #define MAX_BUFFER 16384
 #define DB_FILE "users.db"
 #define MAX_SESSIONS 100
@@ -586,11 +585,260 @@ void handle_student_server(int socket_fd, char *buffer) {
         handle_submit_practice(socket_fd, buffer + 16);
     } else if (strncmp(buffer, "GET_EXAM_HISTORY", 16) == 0) {
         send_exam_history(socket_fd);
+    } else if (strncmp(buffer, "LOGOUT", 6) == 0) {
+        handle_logout(socket_fd);
+    } else {
+        printf("Unknown message: %s\n", buffer);
     }
 }
 
-void handle_teacher_server() {
+void handle_get_questions(int socket_fd) {
+    char *sql = "SELECT question_id, question_text, difficulty "
+                "FROM questions "
+                "ORDER BY question_id;";
+                
+    sqlite3_stmt *stmt;
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, 0);
+    
+    char response[MAX_BUFFER] = "QUESTIONS:";
+    char temp[1024];
+    int first = 1;
+    
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        if (!first) strcat(response, "|");
+        first = 0;
+        
+        int id = sqlite3_column_int(stmt, 0);
+        const char *text = (const char*)sqlite3_column_text(stmt, 1);
+        int difficulty = sqlite3_column_int(stmt, 2);
+        
+        snprintf(temp, sizeof(temp), "%d,%s,%d", id, text, difficulty);
+        strcat(response, temp);
+    }
+    
+    sqlite3_finalize(stmt);
+    send(socket_fd, response, strlen(response), 0);
+}
 
+void handle_get_question(int socket_fd, int question_id) {
+    char *sql = "SELECT q.question_id, q.question_text, q.difficulty, "
+                "c.choice_id, c.choice_text, c.is_correct "
+                "FROM questions q "
+                "LEFT JOIN choices c ON q.question_id = c.question_id "
+                "WHERE q.question_id = ? "
+                "ORDER BY c.choice_id;";
+                
+    sqlite3_stmt *stmt;
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, 0);
+    sqlite3_bind_int(stmt, 1, question_id);
+    
+    char response[MAX_BUFFER] = "QUESTION:";
+    char temp[1024];
+    
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        snprintf(temp, sizeof(temp), "%d;%s;%d",
+                sqlite3_column_int(stmt, 0),
+                sqlite3_column_text(stmt, 1),
+                sqlite3_column_int(stmt, 2));
+        strcat(response, temp);
+        
+        do {
+            snprintf(temp, sizeof(temp), ";%d;%s;%d",
+                    sqlite3_column_int(stmt, 3),
+                    sqlite3_column_text(stmt, 4),
+                    sqlite3_column_int(stmt, 5));
+            strcat(response, temp);
+        } while (sqlite3_step(stmt) == SQLITE_ROW);
+        
+        send(socket_fd, response, strlen(response), 0);
+    } else {
+        send(socket_fd, "ERROR:Không tìm thấy câu hỏi", 30, 0);
+    }
+    
+    sqlite3_finalize(stmt);
+}
+
+void handle_delete_question(int socket_fd, int question_id) {
+    // Delete choices
+    char *sql = "DELETE FROM choices WHERE question_id = ?;";
+    sqlite3_stmt *stmt;
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, 0);
+    sqlite3_bind_int(stmt, 1, question_id);
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+
+    // Delete question
+    sql = "DELETE FROM questions WHERE question_id = ?;";
+    rc = sqlite3_prepare_v2(db, sql, -1, &stmt, 0);
+    sqlite3_bind_int(stmt, 1, question_id);
+    
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    
+    if (rc == SQLITE_DONE) {
+        send(socket_fd, "SUCCESS:Xóa câu hỏi thành công", 36, 0);
+    } else {
+        send(socket_fd, "ERROR:Không thể xóa câu hỏi", 28, 0);
+    }
+}
+
+void handle_add_question(int socket_fd, char *data) {
+    char question_text[512];
+    int difficulty;
+    char choices[4][256];
+    int is_correct[4];
+    
+    // Parse dữ liệu
+    char *token = strtok(data, "|");
+    strcpy(question_text, token);
+    
+    token = strtok(NULL, "|");
+    difficulty = atoi(token);
+    difficulty += 1;
+    
+    for (int i = 0; i < 4; i++) {
+        token = strtok(NULL, "|");
+        strcpy(choices[i], token);
+        
+        token = strtok(NULL, "|");
+        is_correct[i] = atoi(token);
+    }
+    
+    // Thêm câu hỏi vào database
+    sqlite3_exec(db, "BEGIN TRANSACTION", NULL, NULL, NULL);
+    
+    char *sql = "INSERT INTO questions (question_text, difficulty) VALUES (?, ?);";
+    sqlite3_stmt *stmt;
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, 0);
+    sqlite3_bind_text(stmt, 1, question_text, -1, SQLITE_STATIC);
+    sqlite3_bind_int(stmt, 2, difficulty);
+    
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    
+    if (rc == SQLITE_DONE) {
+        int question_id = sqlite3_last_insert_rowid(db);
+        
+        // Thêm các đáp án
+        sql = "INSERT INTO choices (question_id, choice_text, is_correct) VALUES (?, ?, ?);";
+        for (int i = 0; i < 4; i++) {
+            rc = sqlite3_prepare_v2(db, sql, -1, &stmt, 0);
+            sqlite3_bind_int(stmt, 1, question_id);
+            sqlite3_bind_text(stmt, 2, choices[i], -1, SQLITE_STATIC);
+            sqlite3_bind_int(stmt, 3, is_correct[i]);
+            
+            rc = sqlite3_step(stmt);
+            sqlite3_finalize(stmt);
+            
+            if (rc != SQLITE_DONE) {
+                sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+                send(socket_fd, "ERROR:Không thể thêm đáp án", 28, 0);
+                return;
+            }
+        }
+        
+        sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
+        send(socket_fd, "SUCCESS:Thêm câu hỏi thành công", 37, 0);
+    } else {
+        sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+        send(socket_fd, "ERROR:Không thể thêm câu hỏi", 28, 0);
+    }
+}
+
+void handle_update_question(int socket_fd, char *data) {
+    int question_id;
+    char question_text[512];
+    int difficulty;
+    char choices[4][256];
+    int is_correct[4];
+    
+    // Parse dữ liệu
+    char *token = strtok(data, "|");
+    question_id = atoi(token);
+    
+    token = strtok(NULL, "|");
+    strcpy(question_text, token);
+    
+    token = strtok(NULL, "|");
+    difficulty = atoi(token);
+    difficulty += 1;
+    
+    // Cập nhật câu hỏi
+    char *sql = "UPDATE questions SET question_text = ?, difficulty = ? WHERE question_id = ?";
+    sqlite3_stmt *stmt;
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, 0);
+    sqlite3_bind_text(stmt, 1, question_text, -1, SQLITE_STATIC);
+    sqlite3_bind_int(stmt, 2, difficulty);
+    sqlite3_bind_int(stmt, 3, question_id);
+    
+    rc = sqlite3_step(stmt);
+    char *expanded_sql = sqlite3_expanded_sql(stmt);
+    if (expanded_sql) {
+        printf("Expanded query: %s\n", expanded_sql);
+        sqlite3_free((void *)expanded_sql);
+    }
+    sqlite3_finalize(stmt);
+
+    printf("rc: %d\n", rc);
+    
+    if (rc == SQLITE_DONE) {
+        // Cập nhật các lựa chọn
+        for (int i = 0; i < 4; i++) {
+            token = strtok(NULL, "|");
+            int choice_id = atoi(token);
+            
+            token = strtok(NULL, "|");
+            strcpy(choices[i], token);
+            
+            token = strtok(NULL, "|");
+            is_correct[i] = atoi(token);
+            
+            sql = "UPDATE choices SET choice_text = ?, is_correct = ? WHERE choice_id = ?";
+            rc = sqlite3_prepare_v2(db, sql, -1, &stmt, 0);
+            sqlite3_bind_text(stmt, 1, choices[i], -1, SQLITE_STATIC);
+            sqlite3_bind_int(stmt, 2, is_correct[i]);
+            sqlite3_bind_int(stmt, 3, choice_id);
+            
+            rc = sqlite3_step(stmt);
+            char *expanded_choice_sql = sqlite3_expanded_sql(stmt);
+            if (expanded_choice_sql) {
+                printf("Expanded query: %s\n", expanded_choice_sql);
+                sqlite3_free((void *)expanded_choice_sql);
+            }
+            sqlite3_finalize(stmt);
+            
+            if (rc != SQLITE_DONE) {
+                send(socket_fd, "ERROR:Không thể cập nhật đáp án", 41, 0);
+                return;
+            }
+        }
+        
+        send(socket_fd, "SUCCESS:Cập nhật câu hỏi thành công, mở lại để xem sự thay đổi", 83, 0);
+    } else {
+        send(socket_fd, "ERROR:Không thể cập nhật câu hỏi", 42, 0);
+    }
+}
+
+void handle_teacher_server(int socket_fd, char *buffer) {
+    if (strncmp(buffer, "GET_QUESTIONS", 13) == 0) {
+        handle_get_questions(socket_fd);
+    } else if (strncmp(buffer, "GET_QUESTION|", 13) == 0) {
+        int question_id;
+        sscanf(buffer + 13, "%d", &question_id);
+        handle_get_question(socket_fd, question_id);
+    } else if (strncmp(buffer, "DELETE_QUESTION|", 16) == 0) {
+        int question_id;
+        sscanf(buffer + 16, "%d", &question_id);
+        handle_delete_question(socket_fd, question_id);
+    } else if (strncmp(buffer, "ADD_QUESTION|", 13) == 0) {
+        handle_add_question(socket_fd, buffer + 13);
+    } else if (strncmp(buffer, "UPDATE_QUESTION|", 16) == 0) {
+        handle_update_question(socket_fd, buffer + 16);
+    } else if (strncmp(buffer, "LOGOUT", 6) == 0) {
+        handle_logout(socket_fd);
+    } else {
+        printf("Unknown message: %s\n", buffer);
+    }
 }
 
 void handle_logout(int socket_fd) {
@@ -600,14 +848,34 @@ void handle_logout(int socket_fd) {
             loggedInUsers[i].user_id = 0;
             memset(loggedInUsers[i].username, 0, sizeof(loggedInUsers[i].username));
             memset(loggedInUsers[i].role, 0, sizeof(loggedInUsers[i].role));
+            printf("User logged out: %s\n", loggedInUsers[i].username);
             break;
         }
     }
+
 }
 
-int main() {
-    int server_fd, new_socket, max_sd, sd, activity, valread;
+int main(int argc, char *argv[]) {
+    if (argc != 2) {
+        printf("Sử dụng: %s <port>\n", argv[0]);
+        return 1;
+    }
+    
+    int port = atoi(argv[1]);
+    if (port <= 0 || port > 65535) {
+        printf("Port không hợp lệ. Vui lòng sử dụng port từ 1-65535\n");
+        return 1;
+    }
+
+    // Xóa define PORT cũ và sử dụng port từ argument
     struct sockaddr_in address;
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(port);
+    
+    printf("Server đang chạy trên port %d...\n", port);
+    
+    int server_fd, new_socket, max_sd, sd, activity, valread;
     int opt = 1;
     int addrlen = sizeof(address);
     char buffer[MAX_BUFFER] = {0};
@@ -625,10 +893,6 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(PORT);
-
     // Bind socket
     if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
         perror("Bind failed");
@@ -640,8 +904,6 @@ int main() {
         perror("Listen failed");
         exit(EXIT_FAILURE);
     }
-
-    printf("Server is running on port %d...\n", PORT);
 
     init_logged_in_users();
     // Khởi tạo database
@@ -711,9 +973,7 @@ int main() {
                 } else if (strcmp(currentSocketUser.role, "student") == 0) {
                     handle_student_server(sd, buffer);
                 } else if (strcmp(currentSocketUser.role, "teacher") == 0) {
-                    handle_teacher_server();
-                } else if (strncmp(buffer, "LOGOUT", 6) == 0) {
-                    handle_logout(sd);
+                    handle_teacher_server(sd, buffer);
                 } else {
                     printf("Unknown message: %s\n", buffer);
                 }
