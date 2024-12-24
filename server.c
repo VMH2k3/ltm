@@ -588,9 +588,210 @@ void handle_student_server(int socket_fd, char *buffer) {
         send_exam_history(socket_fd);
     }
 }
+void handle_update_room_questions(int socket_fd, char *request) {
+    int room_id;
+    char *questions_data = strchr(request, '|');
+    if (!questions_data) {
+        send(socket_fd, "ERROR:Invalid request format", 27, 0);
+        return;
+    }
+    
+    // Bỏ qua ký tự '|'
+    questions_data++;
+    sscanf(request, "UPDATE_ROOM_QUESTIONS|%d", &room_id);
 
-void handle_teacher_server() {
+    // Bắt đầu transaction
+    char *err_msg = 0;
+    sqlite3_exec(db, "BEGIN TRANSACTION", 0, 0, &err_msg);
 
+    // Xóa tất cả câu hỏi hiện tại của phòng thi
+    char *delete_sql = "DELETE FROM exam_questions WHERE room_id = ?;";
+    sqlite3_stmt *delete_stmt;
+    int rc = sqlite3_prepare_v2(db, delete_sql, -1, &delete_stmt, 0);
+    sqlite3_bind_int(delete_stmt, 1, room_id);
+    
+    if (sqlite3_step(delete_stmt) != SQLITE_DONE) {
+        printf("Error deleting existing questions: %s\n", sqlite3_errmsg(db));
+        sqlite3_finalize(delete_stmt);
+        sqlite3_exec(db, "ROLLBACK", 0, 0, 0);
+        send(socket_fd, "ERROR:Failed to delete existing questions", 39, 0);
+        return;
+    }
+    sqlite3_finalize(delete_stmt);
+
+    // Thêm các câu hỏi mới được chọn
+    char *insert_sql = "INSERT INTO exam_questions (room_id, question_id) VALUES (?, ?);";
+    sqlite3_stmt *insert_stmt;
+    rc = sqlite3_prepare_v2(db, insert_sql, -1, &insert_stmt, 0);
+
+    char *question = strtok(questions_data, "|");
+    while (question != NULL) {
+        int question_id;
+        int is_selected;
+        sscanf(question, "%d,%d", &question_id, &is_selected);
+        
+        // Chỉ thêm câu hỏi nếu checkbox được chọn
+        if (is_selected == 1) {
+            sqlite3_bind_int(insert_stmt, 1, room_id);
+            sqlite3_bind_int(insert_stmt, 2, question_id);
+            
+            if (sqlite3_step(insert_stmt) != SQLITE_DONE) {
+                printf("Error inserting question %d: %s\n", question_id, sqlite3_errmsg(db));
+                sqlite3_finalize(insert_stmt);
+                sqlite3_exec(db, "ROLLBACK", 0, 0, 0);
+                send(socket_fd, "ERROR:Failed to insert questions", 31, 0);
+                return;
+            }
+            sqlite3_reset(insert_stmt);
+        }
+        
+        question = strtok(NULL, "|");
+    }
+
+    sqlite3_finalize(insert_stmt);
+
+    // Commit transaction
+    rc = sqlite3_exec(db, "COMMIT", 0, 0, &err_msg);
+    if (rc != SQLITE_OK) {
+        printf("Error committing transaction: %s\n", err_msg);
+        sqlite3_free(err_msg);
+        sqlite3_exec(db, "ROLLBACK", 0, 0, 0);
+        send(socket_fd, "ERROR:Failed to commit changes", 29, 0);
+        return;
+    }
+
+    // Gửi thông báo thành công
+    send(socket_fd, "SUCCESS:Questions updated successfully", 36, 0);
+}
+void handle_get_room_questions(int socket_fd, int room_id) {
+    char *sql = "SELECT q.question_id, q.question_text, q.difficulty, "
+                "CASE WHEN eq.room_id IS NOT NULL THEN 1 ELSE 0 END as is_selected "
+                "FROM questions q "
+                "LEFT JOIN exam_questions eq ON q.question_id = eq.question_id AND eq.room_id = ? "
+                "ORDER BY q.question_id;";
+                
+    sqlite3_stmt *stmt;
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, 0);
+    sqlite3_bind_int(stmt, 1, room_id);
+    
+    char response[MAX_BUFFER];
+    memset(response, 0, MAX_BUFFER);
+    strcpy(response, "QUESTIONS:");
+    
+    char temp[1024];
+    int first = 1;
+    
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        if (!first) {
+            strcat(response, "|");
+        }
+        
+        int id = sqlite3_column_int(stmt, 0);
+        const unsigned char *text = sqlite3_column_text(stmt, 1);
+        int difficulty = sqlite3_column_int(stmt, 2);
+        int is_selected = sqlite3_column_int(stmt, 3);
+        
+        if (text) {
+            snprintf(temp, sizeof(temp), "%d,%s,%d,%d", 
+                    id, text, difficulty, is_selected);
+            if (strlen(response) + strlen(temp) + 2 < MAX_BUFFER) {
+                strcat(response, temp);
+                first = 0;
+            }
+        }
+    }
+    
+    sqlite3_finalize(stmt);
+    send(socket_fd, response, strlen(response), 0);
+}
+void send_score_list(int socket_fd, int room_id) {
+    char *sql = "SELECT u.username, ep.score, ep.start_time, ep.end_time "
+                "FROM exam_participants ep "
+                "JOIN users u ON ep.user_id = u.id "
+                "WHERE ep.room_id = ? "
+                "ORDER BY ep.score DESC";
+                
+    sqlite3_stmt *stmt;
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, 0);
+    
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "Failed to prepare statement: %s\n", sqlite3_errmsg(db));
+        send(socket_fd, "ERROR:Database error", 19, 0);
+        return;
+    }
+
+    sqlite3_bind_int(stmt, 1, room_id);
+    
+    char response[MAX_BUFFER] = "SCORE_LIST:";
+    char temp[MAX_BUFFER];
+    int first = 1;
+    
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *username = (const char *)sqlite3_column_text(stmt, 0);
+        int score = sqlite3_column_int(stmt, 1);
+        const char *start_time = (const char *)sqlite3_column_text(stmt, 2);
+        const char *end_time = (const char *)sqlite3_column_text(stmt, 3);
+        
+        if (!first) {
+            strcat(response, "|");
+        }
+        
+        snprintf(temp, sizeof(temp), "%s,%d,%s,%s",
+                username, score, start_time, end_time);
+        
+        strcat(response, temp);
+        first = 0;
+    }
+    
+    sqlite3_finalize(stmt);
+    send(socket_fd, response, strlen(response), 0);
+}
+int add_exam_room(const char *room_name, int time_limit, const char *start_time, const char *end_time) {
+    char *sql = "INSERT INTO exam_rooms (room_name, time_limit, start_time, end_time) VALUES (?, ?, ?, ?);";
+    sqlite3_stmt *stmt;
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, 0);
+    
+    if (rc != SQLITE_OK) {
+        return 0;
+    }
+
+    sqlite3_bind_text(stmt, 1, room_name, -1, SQLITE_STATIC);
+    sqlite3_bind_int(stmt, 2, time_limit);
+    sqlite3_bind_text(stmt, 3, start_time, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 4, end_time, -1, SQLITE_STATIC);
+
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+
+    return rc == SQLITE_DONE;
+}
+
+// Sửa hàm handle_teacher_server để xử lý các request mới
+void handle_teacher_server(int socket_fd, char *buffer) {
+    if (strncmp(buffer, "GET_EXAM_ROOMS_TEACHER", 22) == 0) {
+        send_exam_rooms(socket_fd);
+    }else if (strncmp(buffer, "GET_SCORE_LIST", 14) == 0) {
+                int room_id;
+        sscanf(buffer + 15, "%d", &room_id);
+        send_score_list(socket_fd, room_id);
+    }else if (strncmp(buffer, "GET_EXAM_ROOMS", 14) == 0) {
+        send_exam_rooms(socket_fd);
+    }else if (strncmp(buffer, "ADD_EXAM_ROOM|", 14) == 0) {
+        char room_name[100], start_time[50], end_time[50];
+        int time_limit;
+        sscanf(buffer + 14, "%[^|]|%d|%[^|]|%s", room_name, &time_limit, start_time, end_time);
+        
+        if (add_exam_room(room_name, time_limit, start_time, end_time)) {
+            send(socket_fd, "SUCCESS:Room added successfully", 29, 0);
+        }
+    }else  if (strncmp(buffer, "GET_ROOM_QUESTIONS|", 19) == 0) {
+        int room_id;
+        sscanf(buffer + 19, "%d", &room_id);
+        handle_get_room_questions(socket_fd, room_id);
+    }if (strncmp(buffer, "UPDATE_ROOM_QUESTIONS|", 21) == 0) {
+        handle_update_room_questions(socket_fd, buffer);
+    }
+       
 }
 
 void handle_logout(int socket_fd) {
@@ -711,7 +912,7 @@ int main() {
                 } else if (strcmp(currentSocketUser.role, "student") == 0) {
                     handle_student_server(sd, buffer);
                 } else if (strcmp(currentSocketUser.role, "teacher") == 0) {
-                    handle_teacher_server();
+                    handle_teacher_server(sd, buffer);
                 } else if (strncmp(buffer, "LOGOUT", 6) == 0) {
                     handle_logout(sd);
                 } else {
