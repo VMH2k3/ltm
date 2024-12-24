@@ -236,8 +236,85 @@ void handle_student_server(int socket_fd, char *buffer) {
     }
 }
 
-void handle_teacher_server() {
+void send_score_list(int socket_fd, int room_id) {
+    char *sql = "SELECT u.username, ep.score, ep.start_time "
+                "FROM exam_participants ep "
+                "JOIN users u ON ep.user_id = u.id "
+                "WHERE ep.room_id = ? "
+                "ORDER BY ep.score DESC";
+                
+    sqlite3_stmt *stmt;
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, 0);
+    
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "Failed to prepare statement: %s\n", sqlite3_errmsg(db));
+        send(socket_fd, "ERROR:Database error", 19, 0);
+        return;
+    }
 
+    sqlite3_bind_int(stmt, 1, room_id);
+    
+    char response[MAX_BUFFER] = "SCORE_LIST:";
+    char temp[MAX_BUFFER];
+    int first = 1;
+    
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *username = (const char *)sqlite3_column_text(stmt, 0);
+        int score = sqlite3_column_int(stmt, 1);
+        const char *start_time = (const char *)sqlite3_column_text(stmt, 2);
+        
+        if (!first) {
+            strcat(response, "|");
+        }
+        
+        snprintf(temp, sizeof(temp), "%s,%d,%s",
+                username, score, start_time ? start_time : "N/A");
+        
+        strcat(response, temp);
+        first = 0;
+    }
+    
+    sqlite3_finalize(stmt);
+    send(socket_fd, response, strlen(response), 0);
+}
+int add_exam_room(const char *room_name, int time_limit, const char *start_time, const char *end_time) {
+    char *sql = "INSERT INTO exam_rooms (room_name, time_limit, start_time, end_time) VALUES (?, ?, ?, ?);";
+    sqlite3_stmt *stmt;
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, 0);
+    
+    if (rc != SQLITE_OK) {
+        return 0;
+    }
+
+    sqlite3_bind_text(stmt, 1, room_name, -1, SQLITE_STATIC);
+    sqlite3_bind_int(stmt, 2, time_limit);
+    sqlite3_bind_text(stmt, 3, start_time, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 4, end_time, -1, SQLITE_STATIC);
+
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+
+    return rc == SQLITE_DONE;
+}
+
+// Sửa hàm handle_teacher_server để xử lý các request mới
+void handle_teacher_server(int socket_fd, char *buffer) {
+    if (strncmp(buffer, "GET_EXAM_ROOMS_TEACHER", 22) == 0) {
+        send_exam_rooms(socket_fd);
+    }else if (strncmp(buffer, "GET_SCORE_LIST", 14) == 0) {
+                int room_id;
+        sscanf(buffer + 15, "%d", &room_id);
+        send_score_list(socket_fd, room_id);
+    }else if (strncmp(buffer, "GET_EXAM_ROOMS", 14) == 0) {
+        send_exam_rooms(socket_fd);
+    }else   if (strncmp(buffer, "ADD_EXAM_ROOM|", 14) == 0) {
+        char room_name[100], start_time[50], end_time[50];
+        int time_limit;
+        sscanf(buffer + 14, "%[^|]|%d|%[^|]|%s", room_name, &time_limit, start_time, end_time);
+        
+        if (add_exam_room(room_name, time_limit, start_time, end_time)) {
+            send(socket_fd, "SUCCESS:Room added successfully", 29, 0);
+        }}    
 }
 
 int main() {
@@ -318,7 +395,7 @@ int main() {
             } else if (strcmp(currentSocketUser.role, "student") == 0) {
                 handle_student_server(new_socket, buffer);
             } else if (strcmp(currentSocketUser.role, "teacher") == 0) {
-                handle_teacher_server();
+                handle_teacher_server(new_socket, buffer);
             }
             else {
                 printf("Unknown message: %s\n", buffer);
