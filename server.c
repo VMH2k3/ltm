@@ -570,28 +570,6 @@ void send_exam_history(int socket_fd) {
     send(socket_fd, response, strlen(response), 0);
 }
 
-void handle_student_server(int socket_fd, char *buffer) {
-    if (strncmp(buffer, "GET_EXAM_ROOMS", 14) == 0) {
-        send_exam_rooms(socket_fd);
-    } else if (strncmp(buffer, "JOIN_EXAM|", 10) == 0) {
-        int room_id;
-        sscanf(buffer + 10, "%d", &room_id);
-        handle_join_exam(socket_fd, room_id);
-    } else if (strncmp(buffer, "SUBMIT_EXAM|", 12) == 0) {
-        handle_submit_exam(socket_fd, buffer + 12);
-    } else if (strncmp(buffer, "GET_PRACTICE_QUESTIONS", 22) == 0) {
-        handle_practice_questions(socket_fd);
-    } else if (strncmp(buffer, "SUBMIT_PRACTICE|", 16) == 0) {
-        handle_submit_practice(socket_fd, buffer + 16);
-    } else if (strncmp(buffer, "GET_EXAM_HISTORY", 16) == 0) {
-        send_exam_history(socket_fd);
-    } else if (strncmp(buffer, "LOGOUT", 6) == 0) {
-        handle_logout(socket_fd);
-    } else {
-        printf("Unknown message: %s\n", buffer);
-    }
-}
-
 void handle_update_room_questions(int socket_fd, char *request) {
     int room_id;
     char *questions_data = strchr(request, '|');
@@ -996,12 +974,17 @@ int add_exam_room(const char *room_name, int time_limit, const char *start_time,
     sqlite3_bind_text(stmt, 4, end_time, -1, SQLITE_STATIC);
 
     rc = sqlite3_step(stmt);
+    char *expanded_sql = sqlite3_expanded_sql(stmt);
+    if (expanded_sql) {
+        printf("Expanded query: %s\n", expanded_sql);
+        sqlite3_free((void *)expanded_sql);
+    }
     sqlite3_finalize(stmt);
 
     return rc == SQLITE_DONE;
 }
 
-void handle_teacher_server(int socket_fd, char *buffer) {
+void handle_server(int socket_fd, char *buffer) {
     if (strncmp(buffer, "GET_QUESTIONS", 13) == 0) {
         handle_get_questions(socket_fd);
     } else if (strncmp(buffer, "GET_QUESTION|", 13) == 0) {
@@ -1021,7 +1004,7 @@ void handle_teacher_server(int socket_fd, char *buffer) {
     } else if (strncmp(buffer, "GET_EXAM_ROOMS_TEACHER", 22) == 0) {
         send_exam_rooms(socket_fd);
     } else if (strncmp(buffer, "GET_SCORE_LIST", 14) == 0) {
-                int room_id;
+        int room_id;
         sscanf(buffer + 15, "%d", &room_id);
         send_score_list(socket_fd, room_id);
     } else if (strncmp(buffer, "GET_EXAM_ROOMS", 14) == 0) {
@@ -1029,10 +1012,10 @@ void handle_teacher_server(int socket_fd, char *buffer) {
     } else if (strncmp(buffer, "ADD_EXAM_ROOM|", 14) == 0) {
         char room_name[100], start_time[50], end_time[50];
         int time_limit;
-        sscanf(buffer + 14, "%[^|]|%d|%[^|]|%s", room_name, &time_limit, start_time, end_time);
+        sscanf(buffer + 14, "%[^|]|%d|%[^|]|%[^\n]", room_name, &time_limit, start_time, end_time);
         
         if (add_exam_room(room_name, time_limit, start_time, end_time)) {
-            send(socket_fd, "SUCCESS:Room added successfully", 29, 0);
+            send(socket_fd, "SUCCESS:Room added successfully", 31, 0);
         }
     } else  if (strncmp(buffer, "GET_ROOM_QUESTIONS|", 19) == 0) {
         int room_id;
@@ -1040,6 +1023,18 @@ void handle_teacher_server(int socket_fd, char *buffer) {
         handle_get_room_questions(socket_fd, room_id);
     } else if (strncmp(buffer, "UPDATE_ROOM_QUESTIONS|", 21) == 0) {
         handle_update_room_questions(socket_fd, buffer);
+    } else if (strncmp(buffer, "JOIN_EXAM|", 10) == 0) {
+        int room_id;
+        sscanf(buffer + 10, "%d", &room_id);
+        handle_join_exam(socket_fd, room_id);
+    } else if (strncmp(buffer, "SUBMIT_EXAM|", 12) == 0) {
+        handle_submit_exam(socket_fd, buffer + 12);
+    } else if (strncmp(buffer, "GET_PRACTICE_QUESTIONS", 22) == 0) {
+        handle_practice_questions(socket_fd);
+    } else if (strncmp(buffer, "SUBMIT_PRACTICE|", 16) == 0) {
+        handle_submit_practice(socket_fd, buffer + 16);
+    } else if (strncmp(buffer, "GET_EXAM_HISTORY", 16) == 0) {
+        send_exam_history(socket_fd);
     } else {
         printf("Unknown message: %s\n", buffer);
     }
@@ -1174,12 +1169,8 @@ int main(int argc, char *argv[]) {
                     } else {
                         send(sd, "FAIL:Username already exists", 26, 0);
                     }
-                } else if (strcmp(currentSocketUser.role, "student") == 0) {
-                    handle_student_server(sd, buffer);
-                } else if (strcmp(currentSocketUser.role, "teacher") == 0) {
-                    handle_teacher_server(sd, buffer);
                 } else {
-                    printf("Unknown message: %s\n", buffer);
+                    handle_server(sd, buffer);
                 }
             }
         }

@@ -37,12 +37,6 @@ typedef struct {
 } AddRoomData;
 
 typedef struct {
-    GtkLabel *label;
-    int minutes;
-    int seconds;
-} TimerData;
-
-typedef struct {
     int question_id;
     int selected_choice;
 } Answer;
@@ -54,6 +48,13 @@ typedef struct {
     int answer_count;
     int sock;
 } ExamData;
+
+typedef struct {
+    GtkLabel *label;
+    int minutes;
+    int seconds;
+    ExamData *exam_data;
+} TimerData;
 
 // Tạo struct để truyền dữ liệu qua callback
 typedef struct {
@@ -86,6 +87,7 @@ static void edit_question(GtkButton *button, gpointer user_data);
 static void delete_question(GtkButton *button, gpointer user_data);
 static void load_questions(GtkListBox *list_box, AppData *data);
 static void show_update_question(GtkButton *button, gpointer user_data);
+static void handle_exam_response(GtkDialog *dialog, gint response_id, gpointer user_data);
 
 static void logout(GtkWidget *button, AppData *data) {
     // Gửi thông báo logout đến server
@@ -176,6 +178,7 @@ static gboolean update_timer(gpointer user_data) {
         // Hết giờ
         gtk_label_set_text(data->label, "Hết giờ!");
         g_free(data);  // Giải phóng bộ nhớ
+        handle_exam_response(data->exam_data->dialog, GTK_RESPONSE_ACCEPT, data->exam_data);
         return G_SOURCE_REMOVE;
     }
 
@@ -296,9 +299,6 @@ static void show_exam_interface(AppData *data, const char *exam_data, int room_i
     timer_data->label = GTK_LABEL(time_label);
     timer_data->minutes = time_limit;
     timer_data->seconds = 0;
-    
-    // Thiết lập timer
-    guint timer_id = g_timeout_add_seconds(1, update_timer, timer_data);
 
     // Scrolled window cho danh sách câu hỏi
     GtkWidget *scrolled = gtk_scrolled_window_new();
@@ -395,6 +395,11 @@ static void show_exam_interface(AppData *data, const char *exam_data, int room_i
     gtk_box_append(GTK_BOX(content_area), scrolled);
 
     exam_send_data->dialog = dialog;
+
+    // Thiết lập timer
+    timer_data->exam_data = exam_send_data;
+    guint timer_id = g_timeout_add_seconds(1, update_timer, timer_data);
+
     g_signal_connect(dialog, "response", G_CALLBACK(handle_exam_response), exam_send_data);
     
     gtk_window_present(GTK_WINDOW(dialog));
@@ -727,9 +732,6 @@ static void show_practice_interface(AppData *data, const char *practice_data) {
     timer_data->label = GTK_LABEL(time_label);
     timer_data->minutes = 30;
     timer_data->seconds = 0;
-    
-    // Thiết lập timer
-    guint timer_id = g_timeout_add_seconds(1, update_timer, timer_data);
 
     // Scrolled window cho danh sách câu hỏi
     GtkWidget *scrolled = gtk_scrolled_window_new();
@@ -829,6 +831,10 @@ static void show_practice_interface(AppData *data, const char *practice_data) {
     // Thêm vào content area
     gtk_box_append(GTK_BOX(content_area), header_box);
     gtk_box_append(GTK_BOX(content_area), scrolled);
+
+    timer_data->exam_data = practice_data_struct;
+    // Thiết lập timer
+    guint timer_id = g_timeout_add_seconds(1, update_timer, timer_data);
 
     g_signal_connect(dialog, "response", G_CALLBACK(handle_practice_response), practice_data_struct);
     
@@ -1186,6 +1192,8 @@ static void send_add_room_data(GtkButton *button, gpointer user_data) {
         return;
     }
     
+    printf("End time: %s\n", end_time);
+
     // Chuẩn bị message
     char message[MAX_BUFFER];
     snprintf(message, sizeof(message), "ADD_EXAM_ROOM|%s|%d|%s|%s", 
