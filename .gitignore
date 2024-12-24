@@ -1,0 +1,10 @@
+# Ignore executable files
+*.exe
+*.out
+*.o
+
+# Ignore all files without an extension (commonly executables on Linux)
+*~
+
+# Ignore database files
+*.db
